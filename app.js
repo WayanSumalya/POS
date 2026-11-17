@@ -85,7 +85,7 @@ const IDB = {
   get(s, k) { return new Promise((res, rej) => { const r = IDB.db.transaction(s).objectStore(s).get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
   all(s) { return new Promise((res, rej) => { const r = IDB.db.transaction(s).objectStore(s).getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
   put(s, v, k) { return IDB.tx([s], t => t.objectStore(s).put(v, k)); },
-  del(s, k) { return IDB.tx([s], t => t.objectStore(s).delete(k)); },
+  del(s, k) { if (DOCS.includes(s)) markDirty(bucketOf(s, { id: k })); return IDB.tx([s], t => t.objectStore(s).delete(k)); },
 };
 const ITER = 310000, sub = crypto.subtle;
 async function deriveKey(secret, salt) {
@@ -107,11 +107,11 @@ async function tryUnwrap(u, secret) { try { return await unseal(await deriveKey(
 const validSecret = (role, s) => role === 'admin' ? (s.length >= 8 ? '' : 'Password must be at least 8 characters') : (/^\d{6}$/.test(s) ? '' : 'PIN must be exactly 6 digits');
 
 const fail = () => toast('Could not save! Export a backup now.', true);
-async function persist(store, obj) { const k = dek; if (!k) return; try { await IDB.put(store, { id: obj.id, ts: obj.ts, d: await encObj(obj, k) }); } catch (e) { fail(); } }
+async function persist(store, obj) { const k = dek; if (!k) return; try { await IDB.put(store, { id: obj.id, ts: obj.ts, d: await encObj(obj, k) }); markDirty(bucketOf(store, obj)); } catch (e) { fail(); } }
 const saveProduct = p => persist('products', p);
 const saveSale = s => persist('sales', s);
-async function saveVault() { const k = dek; if (!k || !db) return; try { await IDB.put('vault', { d: await encObj({ settings: db.settings, seq: db.seq }, k) }, 'main'); } catch (e) { fail(); } }
-const saveMeta = () => IDB.put('kv', meta, 'users').catch(fail);
+async function saveVault() { const k = dek; if (!k || !db) return; try { await IDB.put('vault', { d: await encObj({ settings: db.settings, seq: db.seq }, k) }, 'main'); markDirty('vault'); } catch (e) { fail(); } }
+const saveMeta = () => IDB.put('kv', meta, 'users').then(() => markDirty('meta')).catch(fail);
 function logEv(type, text) { if (!db) return; const e = { id: uid(), ts: Date.now(), type, text, user: me ? me.name : '' }; db.log.unshift(e); persist('log', e); }
 async function fullSave() {
   DOCS.forEach(n => { db[n] = db[n] || []; });
@@ -122,6 +122,7 @@ async function fullSave() {
     t.objectStore('vault').put({ d: v }, 'main');
     DOCS.forEach((n, i) => { const o = t.objectStore(n); o.clear(); rows[i].forEach(x => o.put(x)); });
   });
+  markAllDirty();
 }
 async function loadDb() {
   const vault = await decObj((await IDB.get('vault', 'main')).d);
@@ -173,7 +174,8 @@ async function showSetup() {
       <div class="err" id="sErr"></div>
       <button class="btn pri big" data-act="createVault">Create & Start</button>
       <div class="gf" style="text-align:center">If you forget this password the data cannot be recovered. Keep backups.</div>
-      <button class="back" data-act="restore">Restore from backup file</button></div></div>`;
+      <button class="back" data-act="restore">Restore from backup file</button>
+      <button class="back" style="margin-top:6px" data-act="restoreCloud">Restore from cloud backup</button></div></div>`;
 }
 async function createVault() {
   const g = i => $('#' + i).value.trim(), pw = $('#sPw').value, err = $('#sErr');
@@ -193,6 +195,7 @@ async function createVault() {
   logEv('setup', 'Vault created'); lastUser = me.id; enterApp();
 }
 function showLogin() {
+  const c = cloudCfg; cloudCfg = null; if (c && syncSt && syncSt.dirty.length) syncFlush(c); // final upload when locking
   closeScanner(); me = null; db = null; cnt = null; POD = null; dek = null; dekRaw = null; closeModal(); L = { sel: null, pin: '', busy: false, err: '' };
   $('.app').classList.add('locked'); renderLogin();
 }
@@ -203,6 +206,7 @@ function renderLogin() {
       <div class="users">${meta.users.map(x => `<button class="uc" data-act="pick" data-id="${x.id}">${avatar(x, 'lg')}<b>${esc(x.name)}</b><i>${x.role === 'admin' ? 'Administrator' : 'Cashier'}</i></button>`).join('')}</div></div>`;
     return;
   }
+  if (u.needsReset) { m.innerHTML = `<div class="login">${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1><p>This PIN was not part of the cloud backup.<br>Ask an administrator to set a new PIN.</p><button class="back" data-act="pick" data-id="">‹ Switch account</button></div>`; return; }
   const wait = Math.ceil((u.until - Date.now()) / 1000), head = `${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1>`;
   const msg = wait > 0 ? `Too many attempts. Try again in ${wait}s` : L.busy ? 'Unlocking…' : esc(L.err);
   if (u.role === 'admin') {
@@ -244,7 +248,8 @@ async function tryLogin(u, secret) {
 function lock() { cart = cart.slice(); showLogin(); }
 function enterApp() {
   $('.app').classList.remove('locked'); L = { sel: null, pin: '', busy: false, err: '' };
-  view = isAdmin() ? 'dash' : 'sell'; q = ''; cat = 'All'; bump(); render();
+  view = isAdmin() ? 'dash' : 'sell'; q = ''; cat = 'All'; cloudCfg = db.settings.cloud || null; bump(); render();
+  if (cloudCfg && cloudCfg.auto !== false && syncSt && syncSt.dirty.length && !syncSt.paused) scheduleSync();
 }
 let idleT;
 function bump() { clearTimeout(idleT); if (me && meta && meta.autoLock > 0) idleT = setTimeout(() => { if (me) lock(); }, meta.autoLock * 60000); }
@@ -1011,7 +1016,7 @@ function dashView() {
   const low = db.products.filter(p => p.stock !== null && p.stock <= p.low).sort((x, y) => x.stock - y.stock).slice(0, 7);
   const hb = a.hour.map((v, h) => ({ v, label: h % 3 === 0 ? hLabel(h) : '', tip: hLabel(h) + '–' + hLabel((h + 1) % 24) })), busiest = a.hour.indexOf(Math.max(...a.hour));
   const margin = a.rev - a.tax > 0 ? Math.round(a.profit / (a.rev - a.tax) * 100) : 0;
-  return `<div class="page wide"><div class="head"><h1>Dashboard</h1><button class="btn sm" data-act="repPrint">${ICON.print} Print report</button><button class="btn sm" data-act="repCsv">Export CSV</button></div>
+  return `<div class="page wide">${cloudBanner()}<div class="head"><h1>Dashboard</h1><button class="btn sm" data-act="repPrint">${ICON.print} Print report</button><button class="btn sm" data-act="repCsv">Export CSV</button></div>
     <div class="chips" style="margin-bottom:14px">${PER.map(([k, l]) => `<button class="chip ${dashP === k ? 'on' : ''}" data-act="dp" data-p="${k}">${l}</button>`).join('')}</div>
     <div class="kpis">
       ${kpi('Revenue', money(a.rev), delta(a.rev, pv('rev')), pa ? 'vs previous' : '')}
@@ -1101,6 +1106,9 @@ function settingsView() {
       'Cashiers can sell, reprint receipts and see their own sales today. Only administrators manage items, stock, users, voids and settings.')}
     ${G('Security', R('Auto-lock', `<select data-meta="autoLock">${[[0, 'Off'], [1, '1 minute'], [2, '2 minutes'], [5, '5 minutes'], [10, '10 minutes'], [30, '30 minutes']].map(([v, l]) => `<option value="${v}" ${meta.autoLock === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`)
       + BTN('changeOwn', 'Change my password') + BTN('log', 'Activity log') + BTN('lock', 'Lock now'), 'Data is encrypted (AES-256) on this device. 5 wrong attempts trigger a timed lockout.')}
+    ${G('Cloud backup', `<div class="frow" id="cloudStat" style="min-height:64px">${cloudStatHtml()}</div>` + BTN('cloudSetup', cloudCfg ? 'Change repository / token' : 'Set up cloud backup')
+      + (cloudCfg ? BTN('cloudNow', 'Back up now') + R('Automatic backup', `<input type="checkbox" class="sw" data-cloud="auto" ${cloudCfg.auto !== false ? 'checked' : ''}>`) : '') + BTN('cloudRestore', 'Restore from cloud'),
+      'Encrypted copies of your data are sent to your private GitHub repository about 20 seconds after each change, and when you lock the app. Needs internet; otherwise it catches up later.')}
     ${G('Data', BTN('export', 'Export encrypted backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} CSV files are NOT encrypted — keep them private.`)}</div>`;
 }
 
@@ -1127,7 +1135,7 @@ async function saveUser(id) {
   if (!u && meta.users.some(x => x.name.toLowerCase() === name.toLowerCase())) return toast('That name already exists', true);
   toast('Saving…');
   const nu = await makeUser(name, role, sec, dekRaw);
-  if (u) { Object.assign(u, { salt: nu.salt, wrap: nu.wrap, fails: 0, until: 0 }); logEv('user', `Reset credentials for ${u.name}`); }
+  if (u) { Object.assign(u, { salt: nu.salt, wrap: nu.wrap, fails: 0, until: 0 }); delete u.needsReset; logEv('user', `Reset credentials for ${u.name}`); }
   else { meta.users.push(nu); logEv('user', `Added ${role} ${name}`); }
   await saveMeta(); UF = { role: 'cashier' }; closeModal(); render(); toast('Saved');
 }
@@ -1188,15 +1196,254 @@ async function importBackup(file) {
       t.objectStore('kv').put(d.meta, 'users'); t.objectStore('vault').put(d.vault, 'main');
       DOCS.forEach(n => { const o = t.objectStore(n); o.clear(); (d[n] || []).forEach(x => o.put(x)); });
     });
-    meta = d.meta; cart = []; lastUser = null; toast('Backup restored — please sign in'); showLogin();
+    meta = d.meta; cart = []; lastUser = null; markAllDirty(); toast('Backup restored — please sign in'); showLogin();
   } catch (e) { toast('Not a valid EPOS backup file', true); }
 }
 
 /* ====================================================================
    EVENTS
    ==================================================================== */
+/* ====================================================================
+   CLOUD BACKUP — encrypted copies pushed to a PRIVATE GitHub repository
+   - Only already-encrypted records leave the device (same bytes as in IndexedDB).
+   - Incremental: data is split into small files (hash buckets / one file per sales day);
+     only files that changed are uploaded.
+   - Cashier PIN keys are NOT uploaded (6-digit PINs are weak); after a restore the admin resets them.
+   ==================================================================== */
+let syncSt = null, cloudCfg = null, syncBusy = false, syncT = null, syncSaveT = null;
+function bhash(s) { let h = 5381; for (const c of String(s)) h = ((h << 5) + h + c.charCodeAt(0)) >>> 0; return h; }
+function bucketOf(store, o) { return store === 'sales' ? 'sales/' + new Date(o.ts || 0).toLocaleDateString('en-CA') : store + '/' + (bhash(o.id) % 8); }
+function saveSync() { clearTimeout(syncSaveT); syncSaveT = setTimeout(() => { if (syncSt) IDB.put('kv', syncSt, 'sync').catch(() => {}); }, 800); }
+function markDirty(key) { if (!syncSt) return; if (!syncSt.dirty.includes(key)) syncSt.dirty.push(key); saveSync(); scheduleSync(); }
+async function markAllDirty() {
+  if (!syncSt) return; const keys = new Set(['meta', 'vault']);
+  for (const s of DOCS) (await IDB.all(s)).forEach(r => keys.add(bucketOf(s, r)));
+  keys.forEach(k => { if (!syncSt.dirty.includes(k)) syncSt.dirty.push(k); }); saveSync(); scheduleSync();
+}
+function scheduleSync() { clearTimeout(syncT); syncT = setTimeout(() => { if (cloudCfg && cloudCfg.auto !== false) syncFlush(cloudCfg); }, 20000); }
+const rep = (k, v) => v instanceof Uint8Array ? { $b: toB(v) } : v;
+const rev = (k, v) => v && v.$b !== undefined ? fromB(v.$b) : v;
+const repoPath = c => `/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}`;
+async function gh(c, path, opt = {}) {
+  const r = await fetch('https://api.github.com' + path, { method: opt.method || 'GET', headers: { Authorization: 'Bearer ' + c.token, Accept: opt.raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...(opt.body ? { 'Content-Type': 'application/json' } : {}) }, body: opt.body ? JSON.stringify(opt.body) : undefined });
+  if (!r.ok) { const e = new Error(r.status === 401 ? 'Token invalid or expired' : r.status === 403 ? 'Access denied or rate limited' : r.status === 404 ? 'Not found (check owner, repo and token access)' : 'GitHub error ' + r.status); e.status = r.status; throw e; }
+  return opt.raw ? r.text() : r.status === 204 ? null : r.json();
+}
+async function cloudTest(c) {
+  const info = await gh(c, repoPath(c));
+  if (!info.private) throw new Error('The repository must be PRIVATE. Make it private first.');
+  if (info.permissions && !info.permissions.push) throw new Error('Token needs “Contents: Read and write” on this repository');
+}
+async function putFile(c, path, text) {
+  const url = `${repoPath(c)}/contents/${path}`, br = c.branch || 'main', body = { message: 'EPOS backup', content: toB(te.encode(text)), branch: br };
+  let sha = syncSt.shas[path];
+  for (let a = 0; a < 2; a++) {
+    if (sha) body.sha = sha; else delete body.sha;
+    try { const r = await gh(c, url, { method: 'PUT', body }); syncSt.shas[path] = r.content.sha; return; }
+    catch (e) {
+      if (a === 0 && (e.status === 409 || e.status === 422)) { try { sha = (await gh(c, `${url}?ref=${encodeURIComponent(br)}`)).sha; } catch (e2) { if (e2.status === 404) sha = null; else throw e2; } } else throw e;
+    }
+  }
+}
+/* ---------- Google Drive (hidden app-data folder; sign-in through Google's own sign-in library) ---------- */
+const GOOGLE_CLIENT_ID = ''; // ← OAuth "Web application" client ID of your Google Cloud project (see README). Can also be typed once in the app.
+const gKey = () => GOOGLE_CLIENT_ID || (meta && meta.gKey) || localStorage.getItem('epos.gkey') || '';
+const G_SCOPE = 'https://www.googleapis.com/auth/drive.appdata email';
+let gMem = { tok: '', exp: 0 }, gLastTry = 0, gisP = null, gIdsFor = null;
+function loadGis() { // Google's official sign-in script, loaded only when Google Drive backup is used
+  if (gisP) return gisP;
+  gisP = new Promise((res, rej) => {
+    if (window.google && google.accounts && google.accounts.oauth2) return res();
+    const s = document.createElement('script'); s.src = 'https://accounts.google.com/gsi/client'; s.async = true; s.onload = () => res();
+    s.onerror = () => { gisP = null; rej(new Error('Could not reach Google sign-in. Check the internet connection.')); }; document.head.appendChild(s);
+  });
+  return gisP;
+}
+async function gToken(key, hint, consent) {
+  await loadGis();
+  return new Promise((res, rej) => {
+    const tc = google.accounts.oauth2.initTokenClient({
+      client_id: key, scope: G_SCOPE, hint: hint || undefined,
+      callback: r => { if (r.error) return rej(new Error(r.error === 'access_denied' ? 'Google access was denied' : 'Google sign-in failed: ' + r.error)); gMem = { tok: r.access_token, exp: Date.now() + (r.expires_in - 120) * 1000 }; res(); },
+      error_callback: e => rej(new Error(e && e.type === 'popup_closed' ? 'Google sign-in was closed' : e && e.type === 'popup_failed_to_open' ? 'Popup blocked — allow popups for this site' : 'Google sign-in failed')),
+    });
+    tc.requestAccessToken({ prompt: consent ? 'consent' : '' });
+  });
+}
+async function gRefresh() { // must run inside a tap: Google opens a small popup that closes itself when already allowed
+  const c = cloudCfg; if (!c || c.provider !== 'google') return true; if (Date.now() < gMem.exp) return true;
+  gLastTry = Date.now(); try { await gToken(c.key, c.account, false); syncSt.needAuth = false; return true; } catch (e) { syncSt.err = e.message; uiSync(); return false; }
+}
+async function gd(url, opt = {}) {
+  if (Date.now() >= gMem.exp) { const e = new Error('Waiting for Google reconnection'); e.status = 'auth'; throw e; }
+  const r = await fetch(url, { method: opt.method || 'GET', headers: { Authorization: 'Bearer ' + gMem.tok, ...(opt.type ? { 'Content-Type': opt.type } : {}) }, body: opt.body });
+  if (!r.ok) { if (r.status === 401) gMem.exp = 0; const e = new Error(r.status === 401 ? 'Google sign-in expired' : r.status === 403 ? 'Google Drive access denied or storage full' : r.status === 404 ? 'not found' : 'Google Drive error ' + r.status); e.status = r.status === 401 ? 'auth' : r.status; throw e; }
+  return r;
+}
+const gName = p => p.replace(/\//g, '__');
+async function gLoadIds(force) { // Drive's app folder is flat: we keep a name → file id map
+  if (!force && gIdsFor === syncSt && syncSt.ids) return;
+  const ids = {}; let tok = '';
+  do { const j = await (await gd('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&pageSize=1000&fields=nextPageToken,files(id,name)' + (tok ? '&pageToken=' + encodeURIComponent(tok) : ''))).json(); j.files.forEach(f => { ids[f.name] = f.id; }); tok = j.nextPageToken || ''; } while (tok);
+  syncSt.ids = ids; gIdsFor = syncSt;
+}
+const GDR = {
+  async test() { await gLoadIds(true); },
+  async put(c, path, text) {
+    await gLoadIds(); const name = gName(path), id = syncSt.ids[name];
+    if (id) { try { await gd(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, { method: 'PATCH', type: 'application/json', body: text }); return; } catch (e) { if (e.status !== 404) throw e; } }
+    const b = 'epos' + uid(), body = `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: ['appDataFolder'] })}\r\n--${b}\r\nContent-Type: application/json\r\n\r\n${text}\r\n--${b}--`;
+    const j = await (await gd('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', { method: 'POST', type: `multipart/related; boundary=${b}`, body })).json(); syncSt.ids[name] = j.id;
+  },
+  async get(c, path) { await gLoadIds(); const id = syncSt.ids[gName(path)]; if (!id) return null; try { return await (await gd(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).text(); } catch (e) { if (e.status === 404) return null; throw e; } },
+  async list() { await gLoadIds(true); return Object.keys(syncSt.ids).map(n => n.replace(/__/g, '/')).filter(p => /^data\/.+\.json$/.test(p)).map(path => ({ path })); },
+};
+const GHP = {
+  test: c => cloudTest(c), put: (c, path, text) => putFile(c, path, text),
+  async get(c, path) { try { return await gh(c, `${repoPath(c)}/contents/${path}?ref=${encodeURIComponent(c.branch || 'main')}`, { raw: true }); } catch (e) { if (e.status === 404) return null; throw e; } },
+  async list(c) { const t = await gh(c, `${repoPath(c)}/git/trees/${encodeURIComponent(c.branch || 'main')}?recursive=1`); return t.tree.filter(x => x.type === 'blob' && /^data\/.+\.json$/.test(x.path)).map(x => ({ path: x.path, sha: x.sha })); },
+};
+const prov = c => (c.provider === 'google' ? GDR : GHP);
+const cloudMeta = () => ({ ...meta, fails: [], users: meta.users.map(u => u.role === 'admin' ? u : { ...u, salt: null, wrap: null, needsReset: true }) });
+async function buildFile(key, cache) {
+  if (key === 'meta') return JSON.stringify(cloudMeta(), rep);
+  if (key === 'vault') return JSON.stringify(await IDB.get('vault', 'main'), rep);
+  const store = key.split('/')[0]; cache[store] = cache[store] || await IDB.all(store);
+  return JSON.stringify(cache[store].filter(r => bucketOf(store, r) === key), rep);
+}
+function uiSync() { const el = $('#cloudStat'); if (el) el.innerHTML = cloudStatHtml(); }
+async function syncFlush(c, manual) {
+  if (syncBusy || !c || !syncSt) return false;
+  if (!navigator.onLine) { syncSt.err = 'Offline — will retry when online'; uiSync(); return false; }
+  if (c.provider === 'google' && Date.now() >= gMem.exp) { syncSt.needAuth = true; syncSt.err = ''; uiSync(); return false; } // Google permission lasts 1 h; renewed on the next tap
+  syncBusy = true; syncSt.err = ''; uiSync(); const br = c.branch || 'main'; let done = 0;
+  try {
+    if (!syncSt.adopted) { // never silently overwrite a backup that belongs to another device
+      const mt = await prov(c).get(c, 'data/manifest.json'), man = mt ? JSON.parse(mt) : null;
+      if (man && man.deviceId !== syncSt.deviceId) { syncSt.paused = true; throw new Error('The cloud already holds a backup from another device. Tap “Back up now” to overwrite it, or restore from it.'); }
+      syncSt.adopted = true; syncSt.paused = false;
+    }
+    const cache = {};
+    while (syncSt.dirty.length) {
+      const key = syncSt.dirty.shift(); // removed first: a change made during upload re-marks the key
+      try { await prov(c).put(c, `data/${key}.json`, await buildFile(key, cache)); done++; uiSync(); }
+      catch (e) { if (!syncSt.dirty.includes(key)) syncSt.dirty.push(key); throw e; }
+    }
+    if (done || manual) await prov(c).put(c, 'data/manifest.json', JSON.stringify({ app: 'epos', v: 1, deviceId: syncSt.deviceId, ts: Date.now() }));
+    syncSt.last = Date.now();
+  } catch (e) { syncSt.err = e.message || 'Backup failed'; if (manual) toast('Backup failed: ' + syncSt.err, true); }
+  finally { syncBusy = false; saveSync(); uiSync(); if (view === 'dash') { const b = $('#cloudBanner'); if (b) b.outerHTML = cloudBanner(); } }
+  return !syncSt.err;
+}
+const timeAgo = ts => { const m = Math.round((Date.now() - ts) / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' d ago'; };
+function cloudStatHtml() {
+  if (!cloudCfg) return '<span><span class="dot"></span>Not set up</span><span style="margin-left:auto;color:var(--l2)">Your data exists only on this tablet</span>';
+  const s = syncSt, bad = !!s.err;
+  return `<span><span class="dot ${bad ? '' : 'on'}" style="${bad ? 'background:var(--red)' : ''}"></span>${syncBusy ? 'Backing up…' : bad ? 'Backup problem' : s.needAuth && s.dirty.length ? 'Tap anywhere to reconnect Google' : s.dirty.length ? 'Changes pending' : 'Up to date'}</span>
+    <span style="margin-left:auto;text-align:right;color:var(--l2);font-size:14px">${cloudLabel()} · ${s.last ? timeAgo(s.last) : 'not yet'}${s.dirty.length ? ` · ${s.dirty.length} pending` : ''}${bad ? `<br><b style="color:var(--red)">${esc(s.err)}</b>` : ''}</span>`;
+}
+function cloudBanner() {
+  if (!isAdmin() || !syncSt) return '<span id="cloudBanner"></span>';
+  const stale = cloudCfg && (!syncSt.last || Date.now() - syncSt.last > 3 * DAY);
+  if (cloudCfg && !syncSt.err && !stale) return '<span id="cloudBanner"></span>';
+  const msg = !cloudCfg ? 'Protect your data: set up automatic cloud backup so it survives a lost or broken tablet.' : syncSt.err ? 'Cloud backup problem: ' + syncSt.err : 'No cloud backup in the last 3 days.';
+  return `<button id="cloudBanner" class="card" data-act="nav" data-v="settings" style="width:100%;text-align:left;margin-bottom:12px;display:flex;gap:10px;align-items:center;border:1px solid ${cloudCfg ? 'var(--red)' : 'var(--orange)'}">${ICON.lock}<span style="flex:1"><b>Cloud backup</b><br><small style="color:var(--l2)">${esc(msg)}</small></span><span style="color:var(--tint);font-weight:600">${cloudCfg ? 'Fix' : 'Set up'} ›</span></button>`;
+}
+const cloudLabel = () => cloudCfg.provider === 'google' ? 'Google Drive' + (cloudCfg.account ? ' · ' + esc(cloudCfg.account) : '') : `GitHub ${esc(cloudCfg.owner)}/${esc(cloudCfg.repo)}`;
+function cloudForm(c, restore) {
+  const f = (l, k, ex = '') => `<label class="frow"><span>${l}</span><input id="cl_${k}" value="${esc(c[k] || '')}" autocomplete="off" ${ex}></label>`;
+  return `<div class="group">${f('GitHub user', 'owner', 'placeholder="e.g. WayanSumalya"')}${f('Repository', 'repo', 'placeholder="e.g. pos-backup"')}${f('Branch', 'branch', 'placeholder="main"')}${f('Access token', 'token', 'type="password" placeholder="github_pat_…"')}</div>`;
+}
+const readCloud = () => ({ provider: 'github', owner: $('#cl_owner').value.trim(), repo: $('#cl_repo').value.trim(), branch: $('#cl_branch').value.trim() || 'main', token: $('#cl_token').value.trim(), auto: true });
+/* the simple, one-click screens */
+function cloudSheet() {
+  loadGis().catch(() => {}); // preload so the Google popup opens right after the tap
+  modal(`<h2>Cloud backup</h2><div class="sub">Automatic encrypted backup, so your data survives a broken or lost tablet</div>
+    <button class="btn pri big" data-act="gConnect" data-mode="backup">Connect Google Drive</button>
+    <div class="gf" style="text-align:center">Choose your Google account and tap Allow. Backups then run by themselves into a hidden, private app folder in your Drive — it does not appear in your files and uses almost no space.</div>
+    ${cloudCfg ? '<button class="btn dng" data-act="cloudOff">Turn off backup</button>' : ''}
+    <button class="btn" data-act="cloudAdv">Use a GitHub repository instead (advanced)</button><button class="btn" data-act="close">Cancel</button>`);
+}
+function gKeySheet(mode) {
+  modal(`<h2>One-time Google setup</h2><div class="sub">The shop owner does this once for the whole app</div>
+    <div class="gf">1) Open <b>console.cloud.google.com</b> → create a project (e.g. “EPOS”).<br>2) <b>APIs & Services → Library</b> → enable <i>Google Drive API</i>.<br>3) <b>OAuth consent screen</b> (Google Auth platform): type <i>External</i>, app name EPOS, your e-mail. Add the scope <i>…/auth/drive.appdata</i>. Then <b>Publish app</b> (“In production”) so the permission never expires.<br>4) <b>Credentials → Create credentials → OAuth client ID → Web application</b>. Under <i>Authorized JavaScript origins</i> add <b>${esc(location.origin)}</b> (no path). Create.<br>5) Copy the <b>Client ID</b> (ends with .apps.googleusercontent.com) and paste it here.</div>
+    <div class="group"><label class="frow"><span>Client ID</span><input id="gKeyIn" autocomplete="off" placeholder="…apps.googleusercontent.com"></label></div>
+    <button class="btn pri big" data-act="gKeySave" data-mode="${mode}">Save & continue</button><button class="btn" data-act="${mode === 'restore' && !me ? 'restoreCloudBack' : 'close'}">Cancel</button>`, 'wide');
+}
+async function gConnect(mode) {
+  if (mode === 'backup' && !isAdmin()) return toast('Administrator only', true);
+  const key = gKey(); if (!key) return gKeySheet(mode);
+  toast('Opening Google…');
+  try {
+    await gToken(key, null, true);
+    let email = ''; try { email = (await (await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + gMem.tok } })).json()).email || ''; } catch (e) {}
+    const c = { provider: 'google', key, account: email, auto: true };
+    if (mode === 'restore') {
+      toast('Restoring from Google Drive…'); await cloudRestore(c);
+      cart = []; lastUser = null; cloudCfg = null; closeModal(); toast('Restored — please sign in'); return showLogin();
+    }
+    if (!cloudCfg || cloudCfg.provider !== 'google') { syncSt.adopted = false; syncSt.shas = {}; syncSt.ids = null; }
+    await GDR.test(); db.settings.cloud = c; cloudCfg = c; saveVault(); await markAllDirty(); closeModal(); logEv('cloud', 'Cloud backup connected to Google Drive'); render();
+    toast('Backing up…'); const ok = await syncFlush(c, true); if (ok) toast('Cloud backup is on ✓'); render();
+  } catch (e) { toast(e.message, true); }
+}
+function githubSheet() {
+  modal(`<h2>GitHub backup (advanced)</h2><div class="sub">Encrypted copies in a <b>private</b> GitHub repository</div>${cloudForm(cloudCfg && cloudCfg.provider === 'github' ? cloudCfg : { branch: 'main' })}
+    <div class="gf">1) Create a new <b>private</b> repository (tick “Add a README”). Do <b>not</b> use the public POS repository.<br>2) GitHub → Settings → Developer settings → Fine-grained tokens → Generate: select <i>only</i> that repository, permission <i>Contents: Read and write</i>.<br>3) Paste the token above. The token is stored encrypted on this tablet only.</div>
+    <button class="btn pri big" data-act="cloudSave">Connect & back up</button>${cloudCfg ? '<button class="btn dng" data-act="cloudOff">Turn off & remove token</button>' : ''}<button class="btn" data-act="close">Cancel</button>`, 'wide');
+}
+async function cloudSave() {
+  const c = readCloud(); if (!c.owner || !c.repo || !c.token) return toast('Fill in user, repository and token', true);
+  toast('Checking…'); try { await cloudTest(c); } catch (e) { return toast(e.message, true); }
+  const changed = !cloudCfg || cloudCfg.owner !== c.owner || cloudCfg.repo !== c.repo; if (changed) { syncSt.adopted = false; syncSt.shas = {}; }
+  db.settings.cloud = c; cloudCfg = c; saveVault(); await markAllDirty(); closeModal(); render(); logEv('cloud', `Cloud backup connected to ${c.owner}/${c.repo}`);
+  toast('Backing up…'); const ok = await syncFlush(c, true); if (ok) toast('Cloud backup complete ✓'); render();
+}
+async function cloudRestore(c, progress) {
+  const P = prov(c), files = await P.list(c);
+  if (!files.some(f => f.path === 'data/meta.json') || !files.some(f => f.path === 'data/vault.json')) throw new Error('No EPOS backup found here');
+  const got = {}, q = [...files]; let n = 0;
+  const worker = async () => { while (q.length) { const f = q.shift(); got[f.path] = JSON.parse(await P.get(c, f.path), rev); progress && progress(++n, files.length); } };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  const rows = {}; DOCS.forEach(s => rows[s] = []);
+  Object.entries(got).forEach(([p, arr]) => { const st = p.split('/')[1]; if (rows[st] && Array.isArray(arr)) rows[st].push(...arr); });
+  await IDB.tx(['kv', 'vault', ...DOCS], t => {
+    t.objectStore('kv').put(got['data/meta.json'], 'users'); t.objectStore('vault').put(got['data/vault.json'], 'main');
+    DOCS.forEach(s => { const o = t.objectStore(s); o.clear(); rows[s].forEach(x => o.put(x)); });
+  });
+  const man = got['data/manifest.json'];
+  syncSt = { deviceId: (man && man.deviceId) || uid(), shas: Object.fromEntries(files.map(f => [f.path, f.sha])), dirty: [], last: Date.now(), err: '', adopted: true };
+  await IDB.put('kv', syncSt, 'sync'); meta = got['data/meta.json'];
+}
+function cloudRestoreSheet(fromSetup) {
+  modal(`<h2>Restore from cloud</h2><div class="sub">${fromSetup ? 'Use this on a new or reset tablet' : 'This replaces ALL data on this tablet'}</div>
+    <button class="btn pri big" data-act="gConnect" data-mode="restore">Restore from Google Drive</button>
+    <div class="gf" style="text-align:center">Sign in to the same Google account used for the backup. Then sign in to EPOS with your administrator password.</div>
+    <button class="btn" data-act="githubRestore" data-setup="${fromSetup ? 1 : ''}">Restore from GitHub (advanced)</button><button class="btn" data-act="${fromSetup ? 'restoreCloudBack' : 'close'}">Cancel</button>`);
+}
+function githubRestoreSheet(fromSetup) {
+  modal(`<h2>Restore from GitHub</h2><div class="sub">${fromSetup ? 'Use this on a new or reset tablet' : 'This replaces ALL data on this tablet'}</div>${cloudForm(cloudCfg && cloudCfg.provider === 'github' ? cloudCfg : { branch: 'main' })}
+    <div class="gf" id="clProg">Use the same repository and a token with read access. Sign in afterwards with your administrator password. Cashiers get a new PIN from the administrator.</div>
+    <button class="btn pri big" data-act="cloudDoRestore" data-setup="${fromSetup ? 1 : ''}">Restore</button><button class="btn" data-act="${fromSetup ? 'restoreCloudBack' : 'close'}">Cancel</button>`, 'wide');
+}
+async function cloudDoRestore(fromSetup) {
+  if (!fromSetup && !isAdmin()) return toast('Administrator only', true);
+  const c = readCloud(); if (!c.owner || !c.repo || !c.token) return toast('Fill in user, repository and token', true);
+  if (!fromSetup && !confirm('Replace ALL data on this tablet with the cloud backup?')) return;
+  const p = $('#clProg'); try { await cloudRestore(c, (n, t) => { if (p) p.textContent = `Downloading ${n} / ${t}…`; }); } catch (e) { return toast('Restore failed: ' + e.message, true); }
+  cart = []; lastUser = null; closeModal(); cloudCfg = null; toast('Restored — please sign in'); showLogin();
+}
+// Google access lasts 1 hour: renew it on the next tap (a tap is required for Google's small popup)
+document.addEventListener('click', () => {
+  const c = cloudCfg; if (!c || c.provider !== 'google' || !syncSt || !syncSt.dirty.length || Date.now() < gMem.exp || Date.now() - gLastTry < 120000 || syncBusy) return;
+  gRefresh().then(ok => ok && syncFlush(c));
+}, true);
+document.addEventListener('visibilitychange', () => { if (document.hidden && cloudCfg && syncSt && syncSt.dirty.length) syncFlush(cloudCfg); });
+addEventListener('online', () => { if (cloudCfg && syncSt && syncSt.dirty.length) syncFlush(cloudCfg); });
+setInterval(() => { if (cloudCfg && cloudCfg.auto !== false && syncSt && syncSt.dirty.length && !syncSt.paused) syncFlush(cloudCfg); }, 300000);
+
 const ADMIN_ONLY = new Set(['dp', 'repPrint', 'repCsv', 'repCsv2', 'pickImg', 'rmImg', 'sf', 'sadj', 'edit', 'newProd', 'saveProd', 'delProd', 'void', 'export', 'csv', 'import', 'reset', 'userNew', 'userEdit', 'saveUser', 'removeUser', 'urole', 'log']);
-const ADMIN_RE = /^(scan(Sku|Inv|Count|Po|Rcv)|po[A-Z]|sup|cnt|rc|grn|newPo|newCount|startCount|itab|openPo|pickLogo|rmLogo|custEdit|custAdj|custDel|custCsv)/;
+const ADMIN_RE = /^(cloud(Setup|Save|Off|Now|Restore|Overwrite|Adv)|scan(Sku|Inv|Count|Po|Rcv)|po[A-Z]|sup|cnt|rc|grn|newPo|newCount|startCount|itab|openPo|pickLogo|rmLogo|custEdit|custAdj|custDel|custCsv)/;
 const A = {
   nav: d => { view = d.v; render(); },
   cat: d => { cat = d.c; updateGrid(); },
@@ -1234,6 +1481,23 @@ const A = {
   saveUser: d => saveUser(d.id), removeUser: d => removeUser(d.id),
   changeOwn: () => ownSecretSheet(), saveOwn: () => saveOwn(), log: () => logSheet(),
   lock: () => lock(),
+  /* cloud backup */
+  cloudSetup: () => cloudSheet(),
+  cloudAdv: () => githubSheet(),
+  gConnect: d => { if (d.mode === 'restore' && me && !confirm('Replace ALL data on this tablet with the cloud backup?')) return; gConnect(d.mode); },
+  gKeySave: d => { const k = $('#gKeyIn').value.trim(); if (!/.apps.googleusercontent.com$/.test(k)) return toast('That does not look like a Google Client ID', true); localStorage.setItem('epos.gkey', k); if (meta && me) { meta.gKey = k; saveMeta(); } gConnect(d.mode); },
+  githubRestore: d => githubRestoreSheet(!!d.setup),
+  cloudSave: () => cloudSave(),
+  cloudOff: () => { if (!confirm('Turn off cloud backup and remove the token from this tablet? Existing cloud files are kept.')) return; delete db.settings.cloud; cloudCfg = null; saveVault(); closeModal(); logEv('cloud', 'Cloud backup turned off'); render(); },
+  cloudNow: () => {
+    if (!cloudCfg) return cloudSheet();
+    if (syncSt.paused && !confirm('This repository holds a backup from another device. Overwrite it with the data on this tablet?')) return;
+    if (syncSt.paused) { syncSt.adopted = true; syncSt.paused = false; markAllDirty(); }
+    gRefresh().then(ok => ok && syncFlush(cloudCfg, true)).then(ok => { if (ok) toast('Cloud backup complete ✓'); });
+  },
+  cloudRestore: () => askSecret('Restore from cloud', 'This replaces all data on this tablet. Enter your password to continue.', () => cloudRestoreSheet(false)),
+  cloudDoRestore: d => cloudDoRestore(!!d.setup),
+  restoreCloud: () => cloudRestoreSheet(true), restoreCloudBack: () => { closeModal(); showSetup(); },
   /* camera scanner */
   scanSell: () => openScanner({ title: 'Scan items', continuous: true, onCode: scanHandlers.sell }),
   scanSku: () => openScanner({ title: 'Scan item barcode', onCode: scanHandlers.sku }),
@@ -1379,6 +1643,7 @@ document.addEventListener('change', e => {
     const k = t.dataset.set; S()[k] = t.type === 'checkbox' ? t.checked : ['dec', 'tax', 'paper', 'cashDiscMax', 'earnPer', 'ptValue', 'minRedeem'].includes(k) ? +t.value || 0 : t.value; saveVault();
     if (k === 'store') { meta.store = t.value; saveMeta(); }
     if (['method', 'paper', 'dec', 'cur', 'store', 'loyaltyOn', 'earnPer', 'ptValue'].includes(k)) render();
+  } else if (t.dataset.cloud === 'auto' && isAdmin() && cloudCfg) { cloudCfg.auto = t.checked; db.settings.cloud = cloudCfg; saveVault(); if (t.checked && syncSt.dirty.length) scheduleSync();
   } else if (t.dataset.meta && isAdmin()) { meta[t.dataset.meta] = +t.value; saveMeta(); bump(); }
 });
 $('#imgFile').addEventListener('change', async e => {
@@ -1403,7 +1668,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) close
 /* ---------- boot ---------- */
 (async function boot() {
   if (!window.crypto || !crypto.subtle) { $('#main').innerHTML = '<div class="empty">A secure (HTTPS) connection is required.<br>Open the app from its https:// address.</div>'; return; }
-  try { await IDB.open(); meta = await IDB.get('kv', 'users'); } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
+  try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), shas: {}, dirty: [], last: 0, err: '', adopted: false }; syncSt.err = ''; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
   meta && meta.users && meta.users.length ? showLogin() : showSetup();
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
 })();

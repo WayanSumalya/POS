@@ -26,6 +26,13 @@ Customers tab (cashiers can add/look up; only admins edit, adjust points, delete
 ## Receiving
 Inventory → Receiving: record deliveries as goods-received notes (GRN-0001…) against a purchase order (partial deliveries supported) or without a PO. Supplier invoice number, cost updates, printable.
 
+## Cloud backup (Google Drive, one tap)
+Settings → Cloud backup → **Connect Google Drive** → choose the Google account → Allow. Encrypted data is then uploaded automatically (≈20 s after a change and when the app locks) into Drive's hidden *app data* folder (invisible in My Drive, tiny, only this app can read it). Incremental: only changed files are sent. Cashier PIN keys are not uploaded; after a restore the admin sets new PINs. Restore on a new tablet from the first screen (“Restore from cloud backup” → Restore from Google Drive).
+
+Google only grants access for 1 hour, so about once an hour (when there are unsent changes) the next tap renews it through a small popup that closes by itself.
+
+**One-time setup by the owner** (Google Cloud, free): create a project → enable *Google Drive API* → OAuth consent screen (External, scope `drive.appdata`, **Publish app → In production**) → Credentials → OAuth client ID → *Web application* → Authorized JavaScript origin = the site address (e.g. https://wayansumalya.github.io). Put the Client ID in `GOOGLE_CLIENT_ID` at the top of the Google block in app.js (or type it once in the app). A GitHub private repository is still available as an advanced option.
+
 ## Camera barcode scanner
 Tap the scan icon in the Sell search bar (scan many items in a row), in an item's SKU field, in the Inventory search, in a stock count (each scan adds 1 to the count), or when adding lines to a purchase order / delivery. Uses Chrome's built-in BarcodeDetector (EAN/UPC, Code 128/39, QR…) – no external code. Needs camera permission and HTTPS. Bluetooth/USB scanners also work by typing into the search box. Set each item's SKU to its barcode.
 
