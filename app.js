@@ -203,7 +203,8 @@ function renderLogin() {
   const u = meta.users.find(x => x.id === L.sel), m = $('#main');
   if (!u) {
     m.innerHTML = `<div class="login">${brandMark()}<h1>${esc(meta.store || 'EPOS')}</h1><p>Who’s working?</p>
-      <div class="users">${meta.users.map(x => `<button class="uc" data-act="pick" data-id="${x.id}">${avatar(x, 'lg')}<b>${esc(x.name)}</b><i>${x.role === 'admin' ? 'Administrator' : 'Cashier'}</i></button>`).join('')}</div></div>`;
+      <div class="users">${meta.users.map(x => `<button class="uc" data-act="pick" data-id="${x.id}">${avatar(x, 'lg')}<b>${esc(x.name)}</b><i>${x.role === 'admin' ? 'Administrator' : 'Cashier'}</i></button>`).join('')}</div>
+      <small style="margin-top:26px;color:var(--l3)">EPOS ${APP_VERSION}</small></div>`;
     return;
   }
   if (u.needsReset) { m.innerHTML = `<div class="login">${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1><p>This PIN was not part of the cloud backup.<br>Ask an administrator to set a new PIN.</p><button class="back" data-act="pick" data-id="">‹ Switch account</button></div>`; return; }
@@ -250,6 +251,7 @@ function enterApp() {
   $('.app').classList.remove('locked'); L = { sel: null, pin: '', busy: false, err: '' };
   view = isAdmin() ? 'dash' : 'sell'; q = ''; cat = 'All'; cloudCfg = db.settings.cloud || null; bump(); render();
   if (cloudCfg && cloudCfg.auto !== false && syncSt && syncSt.dirty.length && !syncSt.paused) scheduleSync();
+  if (navigator.onLine && Date.now() - (+localStorage.getItem('epos.vcheck') || 0) > 6 * 3600e3) setTimeout(() => checkUpdate(true), 4000); // quiet check every 6 h
 }
 let idleT;
 function bump() { clearTimeout(idleT); if (me && meta && meta.autoLock > 0) idleT = setTimeout(() => { if (me) lock(); }, meta.autoLock * 60000); }
@@ -275,6 +277,29 @@ function render() {
   else if (view === 'cust') { m.innerHTML = custView(); updateCust(); }
   else if (view === 'settings') m.innerHTML = settingsView();
   else m.innerHTML = accountView();
+}
+
+/* ---------- app version + update check ---------- */
+const APP_VERSION = '2026.11.17-13';
+const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
+async function latestVersion() {
+  const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
+  if (!v) throw new Error('no version'); return v;
+}
+async function checkUpdate(silent) {
+  if (!silent) toast('Checking…');
+  try {
+    const v = await latestVersion(); localStorage.setItem('epos.vcheck', String(Date.now()));
+    if (v === APP_VERSION) { if (!silent) toast('You have the latest version ✓'); return; }
+    if (silent) return toast(`New version ${v} available — Settings → Check for updates`);
+    modal(`<h2>Update available</h2><div class="sub">You have ${APP_VERSION}. The latest is ${esc(v)}.</div><div class="gf" style="text-align:center">Your data is not affected. The app restarts and you sign in again.</div>
+      <button class="btn pri big" data-act="applyUpdate">Update now</button><button class="btn" data-act="close">Later</button>`);
+  } catch (e) { if (!silent) toast('Could not check for updates (offline?)', true); }
+}
+async function applyUpdate() { // refresh the cached app files (data lives in IndexedDB and is untouched)
+  if (cloudCfg && syncSt && syncSt.dirty.length) { try { await syncFlush(cloudCfg); } catch (e) {} }
+  try { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); for (const k of await caches.keys()) await caches.delete(k); } catch (e) {}
+  location.reload();
 }
 
 /* ====================================================================
@@ -1086,7 +1111,7 @@ function accountView() {
   return `<div class="page"><div class="head"><h1>Account</h1></div>
     ${profileCard()}
     ${G('Security', BTN('changeOwn', 'Change my PIN') + BTN('lock', 'Lock / switch user'))}
-    ${G('Printer', printerRows(), S().method === 'rawbt' ? 'Printing through the RawBT app.' : '')}</div>`;
+    ${G('Printer', printerRows(), S().method === 'rawbt' ? 'Printing through the RawBT app.' : '')}${aboutGroup()}</div>`;
 }
 function settingsView() {
   const s = S(), last = meta.lastBackup ? `Last backup: ${fmtDate(meta.lastBackup)}` : 'No backup made yet — export one now.';
@@ -1109,7 +1134,7 @@ function settingsView() {
     ${G('Cloud backup', `<div class="frow" id="cloudStat" style="min-height:64px">${cloudStatHtml()}</div>` + BTN('cloudSetup', cloudCfg ? 'Change repository / token' : 'Set up cloud backup')
       + (cloudCfg ? BTN('cloudNow', 'Back up now') + R('Automatic backup', `<input type="checkbox" class="sw" data-cloud="auto" ${cloudCfg.auto !== false ? 'checked' : ''}>`) : '') + BTN('cloudRestore', 'Restore from cloud'),
       'Encrypted copies of your data are sent to your private GitHub repository about 20 seconds after each change, and when you lock the app. Needs internet; otherwise it catches up later.')}
-    ${G('Data', BTN('export', 'Export encrypted backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} CSV files are NOT encrypted — keep them private.`)}</div>`;
+    ${G('Data', BTN('export', 'Export encrypted backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} CSV files are NOT encrypted — keep them private.`)}${aboutGroup()}</div>`;
 }
 
 /* ---------- team + security sheets (admin) ---------- */
@@ -1481,6 +1506,7 @@ const A = {
   saveUser: d => saveUser(d.id), removeUser: d => removeUser(d.id),
   changeOwn: () => ownSecretSheet(), saveOwn: () => saveOwn(), log: () => logSheet(),
   lock: () => lock(),
+  checkUpdate: () => checkUpdate(false), applyUpdate: () => applyUpdate(),
   /* cloud backup */
   cloudSetup: () => cloudSheet(),
   cloudAdv: () => githubSheet(),
