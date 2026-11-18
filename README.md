@@ -39,6 +39,8 @@ All devices share one database. Sell on the cashier tablet and see it on your ph
 
 How it works: every record is a row (newest change wins); stock is stored as +/- movements, so two devices selling and receiving at the same time add up instead of overwriting each other. Settings → Shop sync shows the status (Live / Offline / pending).
 
+**Server-side roles (recommended):** run `supabase/rls_roles.sql` (read its header first; give your admin account the `admin` role BEFORE running it). Use one shop account for owner devices (`admin`) and a separate one for cashier tablets (`cashier`). The database then refuses cashier writes to products, prices, users, settings, voids and stock additions, even if someone bypasses the app. Tested on PostgreSQL 16 with a mocked Supabase auth; not yet run on your live project.
+
 Good to know: the shop account can read all shop data, so keep it private; EPOS roles (admin/cashier) are enforced inside the app. Keep device clocks on automatic time. Supabase's free plan pauses a project after a week with no activity at all.
 Moving to another host later (e.g. your own server) only means re-implementing the “send / fetch / live” functions in the SHOP SYNC section of `app.js`; the table has two key columns and one JSON column.
 
