@@ -67,13 +67,14 @@ const stockBadge = p => p.stock === null ? '' : p.stock <= 0 ? '<span class="bad
 /* ====================================================================
    STORAGE (IndexedDB) + ENCRYPTION
    ==================================================================== */
-const DOCS = ['products', 'sales', 'log', 'suppliers', 'pos', 'counts', 'customers', 'grn'];
+const DOCS = ['products', 'sales', 'log', 'suppliers', 'pos', 'counts', 'customers', 'grn', 'moves']; // 'moves' = stock changes (+/- amounts) so several devices can add up instead of overwriting each other
+const devId = () => ((typeof syncSt !== 'undefined' && syncSt && syncSt.deviceId) || 'x').slice(0, 6);
 const IDB = {
   db: null,
   open() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open('epos2', 3);
-      r.onupgradeneeded = () => { // v2 adds suppliers/POs/counts, v3 adds customers + goods receipts
+      const r = indexedDB.open('epos2', 4);
+      r.onupgradeneeded = () => { // v2 adds suppliers/POs/counts, v3 adds customers + goods receipts, v4 adds stock moves
         const d = r.result;
         ['kv', 'vault'].forEach(n => { if (!d.objectStoreNames.contains(n)) d.createObjectStore(n); });
         DOCS.forEach(n => { if (!d.objectStoreNames.contains(n)) d.createObjectStore(n, { keyPath: 'id' }); });
@@ -85,7 +86,8 @@ const IDB = {
   get(s, k) { return new Promise((res, rej) => { const r = IDB.db.transaction(s).objectStore(s).get(k); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
   all(s) { return new Promise((res, rej) => { const r = IDB.db.transaction(s).objectStore(s).getAll(); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
   put(s, v, k) { return IDB.tx([s], t => t.objectStore(s).put(v, k)); },
-  del(s, k) { if (DOCS.includes(s)) markDirty(bucketOf(s, { id: k })); return IDB.tx([s], t => t.objectStore(s).delete(k)); },
+  // deleting leaves a small "deleted" marker so other devices learn about it when they sync
+  del(s, k) { if (DOCS.includes(s)) markDirty(s + '/' + k); return IDB.tx([s], t => t.objectStore(s).put({ id: k, ts: 0, upd: Date.now(), del: true })); },
 };
 const ITER = 310000, sub = crypto.subtle;
 async function deriveKey(secret, salt) {
@@ -97,8 +99,9 @@ async function seal(key, bytes) {
   const o = new Uint8Array(12 + ct.length); o.set(iv); o.set(ct, 12); return o;
 }
 async function unseal(key, buf) { buf = new Uint8Array(buf); return new Uint8Array(await sub.decrypt({ name: 'AES-GCM', iv: buf.slice(0, 12) }, key, buf.slice(12))); }
-const encObj = (o, k = dek) => seal(k, te.encode(JSON.stringify(o)));
-const decObj = async b => JSON.parse(td.decode(await unseal(dek, b)));
+// Records are plain JSON (shared through the shop database). Rows saved by older versions are encrypted bytes: still readable, converted when saved again.
+const encObj = async o => JSON.parse(JSON.stringify(o));
+const decObj = async d => d instanceof Uint8Array ? JSON.parse(td.decode(await unseal(dek, d))) : d;
 async function makeUser(name, role, secret, raw) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   return { id: uid(), name, role, salt, wrap: await seal(await deriveKey(secret, salt), raw), created: Date.now(), fails: 0, until: 0 };
@@ -107,29 +110,43 @@ async function tryUnwrap(u, secret) { try { return await unseal(await deriveKey(
 const validSecret = (role, s) => role === 'admin' ? (s.length >= 8 ? '' : 'Password must be at least 8 characters') : (/^\d{6}$/.test(s) ? '' : 'PIN must be exactly 6 digits');
 
 const fail = () => toast('Could not save! Export a backup now.', true);
-async function persist(store, obj) { const k = dek; if (!k) return; try { await IDB.put(store, { id: obj.id, ts: obj.ts, d: await encObj(obj, k) }); markDirty(bucketOf(store, obj)); } catch (e) { fail(); } }
-const saveProduct = p => persist('products', p);
+async function persist(store, obj) { const k = dek; if (!k) return; try { await IDB.put(store, { id: obj.id, ts: obj.ts, upd: Date.now(), dev: obj.dev, d: await encObj(obj, k) }); markDirty(store + '/' + obj.id); } catch (e) { fail(); } }
+const saveProduct = p => persist('products', p.stock === null ? p : { ...p, stock: 0 }); // stock itself is the sum of its moves, never stored in the product
 const saveSale = s => persist('sales', s);
-async function saveVault() { const k = dek; if (!k || !db) return; try { await IDB.put('vault', { d: await encObj({ settings: db.settings, seq: db.seq }, k) }, 'main'); markDirty('vault'); } catch (e) { fail(); } }
-const saveMeta = () => IDB.put('kv', meta, 'users').then(() => markDirty('meta')).catch(fail);
-function logEv(type, text) { if (!db) return; const e = { id: uid(), ts: Date.now(), type, text, user: me ? me.name : '' }; db.log.unshift(e); persist('log', e); }
+async function saveVault() { const k = dek; if (!k || !db) return; try { await IDB.put('vault', { d: await encObj({ settings: db.settings, seq: db.seq }, k), upd: Date.now() }, 'main'); markDirty('vault'); } catch (e) { fail(); } }
+const saveMeta = () => { meta.upd = Date.now(); return IDB.put('kv', meta, 'users').then(() => markDirty('meta')).catch(fail); };
+function logEv(type, text) { if (!db) return; const e = { id: uid(), ts: Date.now(), type, text, user: me ? me.name : '', dev: devId() }; db.log.unshift(e); persist('log', e); }
 async function fullSave() {
   DOCS.forEach(n => { db[n] = db[n] || []; });
-  const enc = async a => Promise.all(a.map(async o => ({ id: o.id, ts: o.ts, d: await encObj(o) })));
+  const enc = async a => Promise.all(a.map(async o => ({ id: o.id, ts: o.ts, upd: Date.now(), dev: o.dev, d: await encObj(o.stock === null || o.stock === undefined || !('cat' in o) ? o : { ...o, stock: 0 }) })));
   const rows = await Promise.all(DOCS.map(n => enc(db[n])));
   const v = await encObj({ settings: db.settings, seq: db.seq });
   await IDB.tx(['vault', ...DOCS], t => {
-    t.objectStore('vault').put({ d: v }, 'main');
+    t.objectStore('vault').put({ d: v, upd: Date.now() }, 'main');
     DOCS.forEach((n, i) => { const o = t.objectStore(n); o.clear(); rows[i].forEach(x => o.put(x)); });
   });
   markAllDirty();
 }
 async function loadDb() {
   const vault = await decObj((await IDB.get('vault', 'main')).d);
-  const dec = async s => Promise.all((await IDB.all(s)).map(r => decObj(r.d)));
-  const [products, sales, log, suppliers, pos, counts, customers, grn] = await Promise.all(DOCS.map(dec));
+  const dec = async s => Promise.all((await IDB.all(s)).filter(r => !r.del).map(r => decObj(r.d)));
+  const [products, sales, log, suppliers, pos, counts, customers, grn, moves] = await Promise.all(DOCS.map(dec));
   const byTs = (a, b) => (b.ts || 0) - (a.ts || 0);
-  db = { settings: { ...DEF, ...vault.settings }, seq: vault.seq || 0, products, sales: sales.sort(byTs), log: log.sort(byTs), suppliers, pos: pos.sort(byTs), counts: counts.sort(byTs), customers, grn: grn.sort(byTs) };
+  db = { settings: { ...DEF, ...vault.settings }, seq: vault.seq || 0, products, sales: sales.sort(byTs), log: log.sort(byTs), suppliers, pos: pos.sort(byTs), counts: counts.sort(byTs), customers, grn: grn.sort(byTs), moves };
+  migrateMoves(); recomputeStock();
+}
+/* Stock = sum of all its moves. Data from before this existed has plain stock numbers: turn each into one starting move (same id on every device, so it is never counted twice). */
+function migrateMoves() {
+  const has = new Set(db.moves.map(m => m.pid));
+  db.products.forEach(p => { if (p.stock > 0 && !has.has(p.id)) { const m = { id: 'init-' + p.id, ts: 0, pid: p.id, d: p.stock, dev: '0' }; db.moves.push(m); persist('moves', m); } });
+}
+function recomputeStock() {
+  const s = {}; db.moves.forEach(m => { s[m.pid] = (s[m.pid] || 0) + m.d; });
+  db.products.forEach(p => { if (p.stock !== null) p.stock = s[p.id] || 0; });
+}
+function setStock(p, n) { // every stock change is recorded as +/- amount
+  const d = n - (p.stock || 0); p.stock = n; if (!d) return;
+  const m = { id: uid(), ts: Date.now(), pid: p.id, d, dev: devId() }; (db.moves = db.moves || []).push(m); persist('moves', m);
 }
 const nextNo = (prefix, arr) => prefix + String(arr.reduce((m, x) => Math.max(m, parseInt(String(x.no).replace(/\D/g, '')) || 0), 0) + 1).padStart(4, '0');
 
@@ -174,8 +191,7 @@ async function showSetup() {
       <div class="err" id="sErr"></div>
       <button class="btn pri big" data-act="createVault">Create & Start</button>
       <div class="gf" style="text-align:center">If you forget this password the data cannot be recovered. Keep backups.</div>
-      <button class="back" data-act="restore">Restore from backup file</button>
-      <button class="back" style="margin-top:6px" data-act="restoreCloud">Restore from cloud backup</button></div></div>`;
+      <button class="back" data-act="restore">Restore from backup file</button></div></div>`;
 }
 async function createVault() {
   const g = i => $('#' + i).value.trim(), pw = $('#sPw').value, err = $('#sErr');
@@ -185,17 +201,17 @@ async function createVault() {
   err.textContent = 'Creating secure vault…';
   dek = await sub.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
   const raw = new Uint8Array(await sub.exportKey('raw', dek));
-  meta = { users: [], autoLock: 5, lastBackup: 0, fails: [], store: g('sStore') };
+  meta = { users: [], autoLock: 5, lastBackup: 0, fails: [], store: g('sStore'), upd: Date.now() };
   const u = await makeUser(g('sName'), 'admin', pw, raw); meta.users.push(u);
   db = legacy || { settings: { ...DEF }, seq: 0, products: $('#sSample') && $('#sSample').checked ? seedData() : [], sales: [], log: [] };
-  DOCS.forEach(n => { db[n] = db[n] || []; });
+  DOCS.forEach(n => { db[n] = db[n] || []; }); migrateMoves();
   db.settings.store = g('sStore'); me = { id: u.id, name: u.name, role: 'admin' }; dekRaw = raw;
   await IDB.put('kv', meta, 'users'); await fullSave();
   if (legacy) legacyWipe();
   logEv('setup', 'Vault created'); lastUser = me.id; enterApp();
 }
 function showLogin() {
-  const c = cloudCfg; cloudCfg = null; if (c && syncSt && syncSt.dirty.length) syncFlush(c); // final upload when locking
+  if (syncSt && sb && syncSt.dirty.length) syncFlush(); // send what is left when locking
   closeScanner(); me = null; db = null; cnt = null; POD = null; dek = null; dekRaw = null; closeModal(); L = { sel: null, pin: '', busy: false, err: '' };
   $('.app').classList.add('locked'); renderLogin();
 }
@@ -249,8 +265,8 @@ async function tryLogin(u, secret) {
 function lock() { cart = cart.slice(); showLogin(); }
 function enterApp() {
   $('.app').classList.remove('locked'); L = { sel: null, pin: '', busy: false, err: '' };
-  view = isAdmin() ? 'dash' : 'sell'; q = ''; cat = 'All'; cloudCfg = db.settings.cloud || null; bump(); render();
-  if (cloudCfg && cloudCfg.auto !== false && syncSt && syncSt.dirty.length && !syncSt.paused) scheduleSync();
+  view = isAdmin() ? 'dash' : 'sell'; q = ''; cat = 'All'; bump(); render();
+  sbStart(); // live sync with the shop database
   if (navigator.onLine && Date.now() - (+localStorage.getItem('epos.vcheck') || 0) > 6 * 3600e3) setTimeout(() => checkUpdate(true), 4000); // quiet check every 6 h
 }
 let idleT;
@@ -280,7 +296,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.17-13';
+const APP_VERSION = '2026.11.18-15';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
@@ -297,7 +313,7 @@ async function checkUpdate(silent) {
   } catch (e) { if (!silent) toast('Could not check for updates (offline?)', true); }
 }
 async function applyUpdate() { // refresh the cached app files (data lives in IndexedDB and is untouched)
-  if (cloudCfg && syncSt && syncSt.dirty.length) { try { await syncFlush(cloudCfg); } catch (e) {} }
+  if (syncSt && sb && syncSt.dirty.length) { try { await syncFlush(); } catch (e) {} }
   try { for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister(); for (const k of await caches.keys()) await caches.delete(k); } catch (e) {}
   location.reload();
 }
@@ -511,7 +527,7 @@ function finishSale(print) {
     c.points = Math.max(0, c.points - used + earned); c.spent = r2((c.spent || 0) + t.total); c.visits = (c.visits || 0) + 1; c.lastVisit = sale.ts; persist('customers', c);
     sale.customerId = c.id; sale.customerName = c.name; sale.pts = { earned, used, balance: c.points };
   }
-  sale.items.forEach(i => { const p = prod(i.id); if (p && p.stock !== null) { p.stock = Math.max(0, p.stock - i.qty); saveProduct(p); } });
+  sale.items.forEach(i => { const p = prod(i.id); if (p && p.stock !== null) setStock(p, Math.max(0, p.stock - i.qty)); });
   db.sales.unshift(sale); cart = []; discount = 0; custId = null; saveSale(sale); saveVault();
   if (t.disc) logEv('discount', `${sale.no}: discount ${money(t.disc)}`);
   closeModal(); render(); showReceipt(sale); if (print) doPrint(sale);
@@ -730,7 +746,7 @@ function applyReceive() {
   const g = { id: uid(), no: nextNo('GRN-', db.grn), ts: Date.now(), by: me.name, poId: r.poId || '', poNo: r.poNo || '', supplierId: r.supplierId, supplierName: po ? po.supplierName : sup.name, invoice: r.invoice.trim(), note: r.note.trim(),
     items: items.map(i => ({ id: i.id, name: i.name, qty: i.qty, cost: +i.cost || 0 })), units, total: 0 };
   g.total = r2(g.items.reduce((a, i) => a + i.qty * i.cost, 0));
-  g.items.forEach(i => { const p = prod(i.id); if (p) { if (p.stock !== null) p.stock += i.qty; if (r.upd && i.cost) p.cost = i.cost; saveProduct(p); } });
+  g.items.forEach(i => { const p = prod(i.id); if (p) { if (p.stock !== null) setStock(p, p.stock + i.qty); if (r.upd && i.cost) { p.cost = i.cost; saveProduct(p); } } });
   if (po) {
     po.items.forEach(l => { const x = g.items.find(i => i.id === l.id); if (x) l.recv = (l.recv || 0) + x.qty; });
     po.status = po.items.every(i => (i.recv || 0) >= i.qty) ? 'received' : 'partial'; if (po.status === 'received') po.receivedTs = Date.now();
@@ -921,7 +937,7 @@ function applyCount() {
   const c = cnt, sm = cntSummary(c);
   c.lines.forEach(l => {
     if (l.counted === null) return; const d = l.counted - l.sys; if (!d) return; const p = prod(l.id); if (!p || p.stock === null) return;
-    const before = p.stock; p.stock = Math.max(0, p.stock + d); saveProduct(p); logEv('count', `${c.no} ${p.name}: ${before} → ${p.stock} (${d > 0 ? '+' : ''}${d})`);
+    const before = p.stock; setStock(p, Math.max(0, p.stock + d)); logEv('count', `${c.no} ${p.name}: ${before} → ${p.stock} (${d > 0 ? '+' : ''}${d})`);
   });
   c.status = 'applied'; c.appliedTs = Date.now(); c.summary = sm; clearTimeout(cntT);
   persist('counts', c); logEv('count', `Applied ${c.no}: ${sm.diffItems} differences, ${sm.net > 0 ? '+' : ''}${sm.net} units, ${money(sm.val)}`);
@@ -968,8 +984,8 @@ function saveProd(id) {
   const sku = g('fSku'); if (sku && db.products.some(x => x.sku === sku && x.id !== id)) return toast('SKU already used by another item', true);
   const d = { name: g('fName'), icon: g('fIcon'), img: imgDraft, sku, cat: g('fCat'), price: +g('fPrice'), cost: +g('fCost') || 0, stock: g('fStock') === '' ? null : Math.max(0, parseInt(g('fStock'))), low: parseInt(g('fLow')) || 0 };
   let p;
-  if (id) { p = prod(id); if (p.price !== d.price) logEv('price', `${p.name}: price ${money(p.price)} → ${money(d.price)}`); if (p.stock !== d.stock) logEv('stock', `${p.name}: stock ${p.stock ?? '–'} → ${d.stock ?? '–'}`); Object.assign(p, d); }
-  else { p = { id: uid(), ...d }; db.products.push(p); logEv('item', `Added item ${p.name}`); }
+  if (id) { p = prod(id); if (p.price !== d.price) logEv('price', `${p.name}: price ${money(p.price)} → ${money(d.price)}`); if (p.stock !== d.stock) logEv('stock', `${p.name}: stock ${p.stock ?? '–'} → ${d.stock ?? '–'}`); const ns = d.stock; delete d.stock; Object.assign(p, d); if (ns === null) p.stock = null; else { if (p.stock === null) p.stock = db.moves.filter(m => m.pid === p.id).reduce((a, m) => a + m.d, 0); setStock(p, ns); } }
+  else { const ns = d.stock; d.stock = ns === null ? null : 0; p = { id: uid(), ...d }; db.products.push(p); if (ns) setStock(p, ns); logEv('item', `Added item ${p.name}`); }
   saveProduct(p); closeModal(); render(); toast('Saved');
 }
 
@@ -1130,10 +1146,9 @@ function settingsView() {
     ${G('Team', meta.users.map(u => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="userEdit" data-id="${u.id}">${avatar(u)}<span class="m"><b>${esc(u.name)}${u.id === me.id ? ' (you)' : ''}</b><small>${u.role === 'admin' ? 'Administrator · password' : 'Cashier · 6-digit PIN'}</small></span><i style="color:var(--l3);font-style:normal;font-size:22px">›</i></button>`).join('') + BTN('userNew', 'Add user'),
       'Cashiers can sell, reprint receipts and see their own sales today. Only administrators manage items, stock, users, voids and settings.')}
     ${G('Security', R('Auto-lock', `<select data-meta="autoLock">${[[0, 'Off'], [1, '1 minute'], [2, '2 minutes'], [5, '5 minutes'], [10, '10 minutes'], [30, '30 minutes']].map(([v, l]) => `<option value="${v}" ${meta.autoLock === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`)
-      + BTN('changeOwn', 'Change my password') + BTN('log', 'Activity log') + BTN('lock', 'Lock now'), 'Data is encrypted (AES-256) on this device. 5 wrong attempts trigger a timed lockout.')}
-    ${G('Cloud backup', `<div class="frow" id="cloudStat" style="min-height:64px">${cloudStatHtml()}</div>` + BTN('cloudSetup', cloudCfg ? 'Change repository / token' : 'Set up cloud backup')
-      + (cloudCfg ? BTN('cloudNow', 'Back up now') + R('Automatic backup', `<input type="checkbox" class="sw" data-cloud="auto" ${cloudCfg.auto !== false ? 'checked' : ''}>`) : '') + BTN('cloudRestore', 'Restore from cloud'),
-      'Encrypted copies of your data are sent to your private GitHub repository about 20 seconds after each change, and when you lock the app. Needs internet; otherwise it catches up later.')}
+      + BTN('changeOwn', 'Change my password') + BTN('log', 'Activity log') + BTN('lock', 'Lock now'), '5 wrong attempts trigger a timed lockout. Anyone with the shop account can read the shop data, so keep it private.')}
+    ${G('Shop sync', `<div class="frow" id="cloudStat" style="min-height:64px">${cloudStatHtml()}</div>` + BTN('syncNow', 'Sync now') + BTN('shopOut', 'Disconnect this device', 'dng'),
+      'Every device signed in to the same shop account shares this data live. Changes made offline are sent as soon as the connection returns. To add a device: open the app on it and sign in with the shop account.')}
     ${G('Data', BTN('export', 'Export encrypted backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} CSV files are NOT encrypted — keep them private.`)}${aboutGroup()}</div>`;
 }
 
@@ -1229,246 +1244,186 @@ async function importBackup(file) {
    EVENTS
    ==================================================================== */
 /* ====================================================================
-   CLOUD BACKUP — encrypted copies pushed to a PRIVATE GitHub repository
-   - Only already-encrypted records leave the device (same bytes as in IndexedDB).
-   - Incremental: data is split into small files (hash buckets / one file per sales day);
-     only files that changed are uploaded.
-   - Cashier PIN keys are NOT uploaded (6-digit PINs are weak); after a restore the admin resets them.
+   SHOP SYNC — one shared Supabase database; every signed-in device sees changes live.
+   - Each record is a row (store, id, data, upd). The newest change (upd) wins; stock is a sum of +/- moves.
+   - Works offline: changes wait in a queue (syncSt.dirty) and are sent when the connection returns.
+   - To move to another host later, only this section (push / pull / subscribe) has to be re-implemented.
    ==================================================================== */
-let syncSt = null, cloudCfg = null, syncBusy = false, syncT = null, syncSaveT = null;
-function bhash(s) { let h = 5381; for (const c of String(s)) h = ((h << 5) + h + c.charCodeAt(0)) >>> 0; return h; }
-function bucketOf(store, o) { return store === 'sales' ? 'sales/' + new Date(o.ts || 0).toLocaleDateString('en-CA') : store + '/' + (bhash(o.id) % 8); }
+const SB_URL = 'https://esalhunqautagwexipio.supabase.co', SB_KEY = 'sb_publishable_1t6oKD7iIZTEh3TVJQf0gg_ghntkSf_'; // public by design (protected by the shop login + row-level security)
+let syncSt = null, sb = null, sbChan = null, sbLive = false, syncBusy = false, pullBusy = false, syncT = null, syncSaveT = null, rtT = null, rrT = null, pendingRT = [];
+const rep = (k, v) => v instanceof Uint8Array ? { $b: toB(v) } : v;
+const rev = (k, v) => v && v.$b !== undefined ? fromB(v.$b) : v;
+const jclean = o => JSON.parse(JSON.stringify(o, rep));
+const jrestore = o => JSON.parse(JSON.stringify(o), rev);
+const timeAgo = ts => { const m = Math.round((Date.now() - ts) / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' d ago'; };
 function saveSync() { clearTimeout(syncSaveT); syncSaveT = setTimeout(() => { if (syncSt) IDB.put('kv', syncSt, 'sync').catch(() => {}); }, 800); }
 function markDirty(key) { if (!syncSt) return; if (!syncSt.dirty.includes(key)) syncSt.dirty.push(key); saveSync(); scheduleSync(); }
 async function markAllDirty() {
-  if (!syncSt) return; const keys = new Set(['meta', 'vault']);
-  for (const s of DOCS) (await IDB.all(s)).forEach(r => keys.add(bucketOf(s, r)));
-  keys.forEach(k => { if (!syncSt.dirty.includes(k)) syncSt.dirty.push(k); }); saveSync(); scheduleSync();
+  if (!syncSt) return; const have = new Set(syncSt.dirty); have.add('meta'); have.add('vault');
+  for (const s of DOCS) (await IDB.all(s)).forEach(r => have.add(s + '/' + r.id));
+  syncSt.dirty = [...have]; saveSync(); scheduleSync();
 }
-function scheduleSync() { clearTimeout(syncT); syncT = setTimeout(() => { if (cloudCfg && cloudCfg.auto !== false) syncFlush(cloudCfg); }, 20000); }
-const rep = (k, v) => v instanceof Uint8Array ? { $b: toB(v) } : v;
-const rev = (k, v) => v && v.$b !== undefined ? fromB(v.$b) : v;
-const repoPath = c => `/repos/${encodeURIComponent(c.owner)}/${encodeURIComponent(c.repo)}`;
-async function gh(c, path, opt = {}) {
-  const r = await fetch('https://api.github.com' + path, { method: opt.method || 'GET', headers: { Authorization: 'Bearer ' + c.token, Accept: opt.raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...(opt.body ? { 'Content-Type': 'application/json' } : {}) }, body: opt.body ? JSON.stringify(opt.body) : undefined });
-  if (!r.ok) { const e = new Error(r.status === 401 ? 'Token invalid or expired' : r.status === 403 ? 'Access denied or rate limited' : r.status === 404 ? 'Not found (check owner, repo and token access)' : 'GitHub error ' + r.status); e.status = r.status; throw e; }
-  return opt.raw ? r.text() : r.status === 204 ? null : r.json();
+function scheduleSync() { clearTimeout(syncT); syncT = setTimeout(() => syncFlush(), 1200); }
+function sbClient() {
+  if (sb) return sb; if (!window.supabase) return null;
+  sb = supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true, storageKey: 'epos.auth' } });
+  return sb;
 }
-async function cloudTest(c) {
-  const info = await gh(c, repoPath(c));
-  if (!info.private) throw new Error('The repository must be PRIVATE. Make it private first.');
-  if (info.permissions && !info.permissions.push) throw new Error('Token needs “Contents: Read and write” on this repository');
+async function shopSession() { try { const c = sbClient(); if (!c) return null; const { data } = await c.auth.getSession(); return data && data.session; } catch (e) { return null; } }
+
+/* ---------- local row <-> shared row ---------- */
+async function toRemote(key) {
+  if (key === 'meta') return meta ? { store: 'meta', id: 'main', data: jclean({ ...meta, fails: [] }), upd: meta.upd || 1, del: false } : null;
+  if (key === 'vault') { const v = await IDB.get('vault', 'main'); return v ? { store: 'vault', id: 'main', data: await decObj(v.d), upd: v.upd || 1, del: false } : null; }
+  const i = key.indexOf('/'), store = key.slice(0, i), r = await IDB.get(store, key.slice(i + 1));
+  return r ? { store, id: r.id, data: r.del ? null : await decObj(r.d), upd: r.upd || 0, del: !!r.del } : null;
 }
-async function putFile(c, path, text) {
-  const url = `${repoPath(c)}/contents/${path}`, br = c.branch || 'main', body = { message: 'EPOS backup', content: toB(te.encode(text)), branch: br };
-  let sha = syncSt.shas[path];
-  for (let a = 0; a < 2; a++) {
-    if (sha) body.sha = sha; else delete body.sha;
-    try { const r = await gh(c, url, { method: 'PUT', body }); syncSt.shas[path] = r.content.sha; return; }
-    catch (e) {
-      if (a === 0 && (e.status === 409 || e.status === 422)) { try { sha = (await gh(c, `${url}?ref=${encodeURIComponent(br)}`)).sha; } catch (e2) { if (e2.status === 404) sha = null; else throw e2; } } else throw e;
-    }
+const fromRemote = r => { const d = r.data == null ? null : jrestore(r.data); return { id: r.id, ts: (d && d.ts) || 0, upd: r.upd, dev: d && d.dev, d, del: !!r.del }; };
+
+/* ---------- merge (newest change wins) ---------- */
+const NEWER = (a, b) => (a.upd || 0) > (b.upd || 0);
+async function mergeRows(store, rows) {
+  let n = 0;
+  for (const r of rows) {
+    const mine = await IDB.get(store, r.id);
+    if (mine && !NEWER(r, mine)) continue;
+    await IDB.put(store, r); n++;
+    if (!db) continue;
+    const arr = db[store] = db[store] || [], i = arr.findIndex(x => x.id === r.id);
+    if (r.del) { if (i >= 0) arr.splice(i, 1); continue; }
+    const o = await decObj(r.d); if (i >= 0) arr[i] = o; else arr.push(o);
+  }
+  if (n && db && ['sales', 'log', 'pos', 'counts', 'grn'].includes(store)) db[store].sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  return n;
+}
+async function mergeVault(data, upd) { // settings: newest wins, except this device's printer; invoice counter: highest wins
+  if (!data) return 0;
+  const mine = await IDB.get('vault', 'main'), newer = !mine || upd > (mine.upd || 0);
+  if (!db) { if (!newer) return 0; await IDB.put('vault', { d: data, upd }, 'main'); return 1; }
+  const seq = Math.max(db.seq || 0, data.seq || 0);
+  if (!newer && seq === db.seq) return 0;
+  if (newer) { const s = { ...DEF, ...data.settings }; ['method', 'btId', 'btName', 'paper'].forEach(k => { if (db.settings[k] !== undefined) s[k] = db.settings[k]; }); db.settings = s; }
+  db.seq = seq; await IDB.put('vault', { d: { settings: db.settings, seq }, upd: newer ? upd : (mine.upd || 0) }, 'main'); return 1;
+}
+async function mergeMeta(data, upd) { // people, logo, store name: newest wins; auto-lock stays per device
+  if (!data || (meta && (meta.upd || 0) >= upd)) return 0;
+  const keep = meta ? { autoLock: meta.autoLock, lastBackup: meta.lastBackup, fails: meta.fails } : {};
+  meta = { ...data, ...keep, upd }; await IDB.put('kv', meta, 'users'); return 1;
+}
+async function applyRemote(list) {
+  let n = 0; const by = {};
+  for (const r of list) {
+    if (r.store === 'meta') n += await mergeMeta(r.data && jrestore(r.data), r.upd);
+    else if (r.store === 'vault') n += await mergeVault(r.data && jrestore(r.data), r.upd);
+    else if (DOCS.includes(r.store)) (by[r.store] = by[r.store] || []).push(fromRemote(r));
+  }
+  for (const s in by) n += await mergeRows(s, by[s]);
+  if (n && db) { recomputeStock(); queueRender(); }
+  return n;
+}
+function queueRender() { // never redraw while someone is typing
+  clearTimeout(rrT); rrT = setTimeout(function go() {
+    if (!me || !db) return; const a = document.activeElement;
+    if (!$('#modal').classList.contains('hidden') || (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) { rrT = setTimeout(go, 1500); return; }
+    render();
+  }, 250);
+}
+
+/* ---------- send / fetch / live ---------- */
+async function syncPush() {
+  while (syncSt.dirty.length) {
+    const keys = syncSt.dirty.splice(0, 40);
+    try {
+      const rows = []; for (const k of keys) { const r = await toRemote(k); if (r) rows.push(r); }
+      if (rows.length) { const { error } = await sb.from('docs').upsert(rows, { onConflict: 'store,id' }); if (error) throw new Error(error.message); }
+    } catch (e) { keys.forEach(k => { if (!syncSt.dirty.includes(k)) syncSt.dirty.push(k); }); throw e; }
+    saveSync();
   }
 }
-/* ---------- Google Drive (hidden app-data folder; sign-in through Google's own sign-in library) ---------- */
-const GOOGLE_CLIENT_ID = ''; // ← OAuth "Web application" client ID of your Google Cloud project (see README). Can also be typed once in the app.
-const gKey = () => GOOGLE_CLIENT_ID || (meta && meta.gKey) || localStorage.getItem('epos.gkey') || '';
-const G_SCOPE = 'https://www.googleapis.com/auth/drive.appdata email';
-let gMem = { tok: '', exp: 0 }, gLastTry = 0, gisP = null, gIdsFor = null;
-function loadGis() { // Google's official sign-in script, loaded only when Google Drive backup is used
-  if (gisP) return gisP;
-  gisP = new Promise((res, rej) => {
-    if (window.google && google.accounts && google.accounts.oauth2) return res();
-    const s = document.createElement('script'); s.src = 'https://accounts.google.com/gsi/client'; s.async = true; s.onload = () => res();
-    s.onerror = () => { gisP = null; rej(new Error('Could not reach Google sign-in. Check the internet connection.')); }; document.head.appendChild(s);
-  });
-  return gisP;
-}
-async function gToken(key, hint, consent) {
-  await loadGis();
-  return new Promise((res, rej) => {
-    const tc = google.accounts.oauth2.initTokenClient({
-      client_id: key, scope: G_SCOPE, hint: hint || undefined,
-      callback: r => { if (r.error) return rej(new Error(r.error === 'access_denied' ? 'Google access was denied' : 'Google sign-in failed: ' + r.error)); gMem = { tok: r.access_token, exp: Date.now() + (r.expires_in - 120) * 1000 }; res(); },
-      error_callback: e => rej(new Error(e && e.type === 'popup_closed' ? 'Google sign-in was closed' : e && e.type === 'popup_failed_to_open' ? 'Popup blocked — allow popups for this site' : 'Google sign-in failed')),
-    });
-    tc.requestAccessToken({ prompt: consent ? 'consent' : '' });
-  });
-}
-async function gRefresh() { // must run inside a tap: Google opens a small popup that closes itself when already allowed
-  const c = cloudCfg; if (!c || c.provider !== 'google') return true; if (Date.now() < gMem.exp) return true;
-  gLastTry = Date.now(); try { await gToken(c.key, c.account, false); syncSt.needAuth = false; return true; } catch (e) { syncSt.err = e.message; uiSync(); return false; }
-}
-async function gd(url, opt = {}) {
-  if (Date.now() >= gMem.exp) { const e = new Error('Waiting for Google reconnection'); e.status = 'auth'; throw e; }
-  const r = await fetch(url, { method: opt.method || 'GET', headers: { Authorization: 'Bearer ' + gMem.tok, ...(opt.type ? { 'Content-Type': opt.type } : {}) }, body: opt.body });
-  if (!r.ok) { if (r.status === 401) gMem.exp = 0; const e = new Error(r.status === 401 ? 'Google sign-in expired' : r.status === 403 ? 'Google Drive access denied or storage full' : r.status === 404 ? 'not found' : 'Google Drive error ' + r.status); e.status = r.status === 401 ? 'auth' : r.status; throw e; }
-  return r;
-}
-const gName = p => p.replace(/\//g, '__');
-async function gLoadIds(force) { // Drive's app folder is flat: we keep a name → file id map
-  if (!force && gIdsFor === syncSt && syncSt.ids) return;
-  const ids = {}; let tok = '';
-  do { const j = await (await gd('https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&pageSize=1000&fields=nextPageToken,files(id,name)' + (tok ? '&pageToken=' + encodeURIComponent(tok) : ''))).json(); j.files.forEach(f => { ids[f.name] = f.id; }); tok = j.nextPageToken || ''; } while (tok);
-  syncSt.ids = ids; gIdsFor = syncSt;
-}
-const GDR = {
-  async test() { await gLoadIds(true); },
-  async put(c, path, text) {
-    await gLoadIds(); const name = gName(path), id = syncSt.ids[name];
-    if (id) { try { await gd(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, { method: 'PATCH', type: 'application/json', body: text }); return; } catch (e) { if (e.status !== 404) throw e; } }
-    const b = 'epos' + uid(), body = `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: ['appDataFolder'] })}\r\n--${b}\r\nContent-Type: application/json\r\n\r\n${text}\r\n--${b}--`;
-    const j = await (await gd('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', { method: 'POST', type: `multipart/related; boundary=${b}`, body })).json(); syncSt.ids[name] = j.id;
-  },
-  async get(c, path) { await gLoadIds(); const id = syncSt.ids[gName(path)]; if (!id) return null; try { return await (await gd(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).text(); } catch (e) { if (e.status === 404) return null; throw e; } },
-  async list() { await gLoadIds(true); return Object.keys(syncSt.ids).map(n => n.replace(/__/g, '/')).filter(p => /^data\/.+\.json$/.test(p)).map(path => ({ path })); },
-};
-const GHP = {
-  test: c => cloudTest(c), put: (c, path, text) => putFile(c, path, text),
-  async get(c, path) { try { return await gh(c, `${repoPath(c)}/contents/${path}?ref=${encodeURIComponent(c.branch || 'main')}`, { raw: true }); } catch (e) { if (e.status === 404) return null; throw e; } },
-  async list(c) { const t = await gh(c, `${repoPath(c)}/git/trees/${encodeURIComponent(c.branch || 'main')}?recursive=1`); return t.tree.filter(x => x.type === 'blob' && /^data\/.+\.json$/.test(x.path)).map(x => ({ path: x.path, sha: x.sha })); },
-};
-const prov = c => (c.provider === 'google' ? GDR : GHP);
-const cloudMeta = () => ({ ...meta, fails: [], users: meta.users.map(u => u.role === 'admin' ? u : { ...u, salt: null, wrap: null, needsReset: true }) });
-async function buildFile(key, cache) {
-  if (key === 'meta') return JSON.stringify(cloudMeta(), rep);
-  if (key === 'vault') return JSON.stringify(await IDB.get('vault', 'main'), rep);
-  const store = key.split('/')[0]; cache[store] = cache[store] || await IDB.all(store);
-  return JSON.stringify(cache[store].filter(r => bucketOf(store, r) === key), rep);
-}
-function uiSync() { const el = $('#cloudStat'); if (el) el.innerHTML = cloudStatHtml(); }
-async function syncFlush(c, manual) {
-  if (syncBusy || !c || !syncSt) return false;
-  if (!navigator.onLine) { syncSt.err = 'Offline — will retry when online'; uiSync(); return false; }
-  if (c.provider === 'google' && Date.now() >= gMem.exp) { syncSt.needAuth = true; syncSt.err = ''; uiSync(); return false; } // Google permission lasts 1 h; renewed on the next tap
-  syncBusy = true; syncSt.err = ''; uiSync(); const br = c.branch || 'main'; let done = 0;
+async function syncPull() {
+  if (pullBusy || !sb) return 0; pullBusy = true; let n = 0;
   try {
-    if (!syncSt.adopted) { // never silently overwrite a backup that belongs to another device
-      const mt = await prov(c).get(c, 'data/manifest.json'), man = mt ? JSON.parse(mt) : null;
-      if (man && man.deviceId !== syncSt.deviceId) { syncSt.paused = true; throw new Error('The cloud already holds a backup from another device. Tap “Back up now” to overwrite it, or restore from it.'); }
-      syncSt.adopted = true; syncSt.paused = false;
+    for (;;) {
+      let q = sb.from('docs').select('store,id,data,upd,del,srv').order('srv', { ascending: true }).limit(500);
+      if (syncSt.srv) q = q.gt('srv', syncSt.srv);
+      const { data, error } = await q; if (error) throw new Error(error.message);
+      if (!data.length) break;
+      n += await applyRemote(data); syncSt.srv = data[data.length - 1].srv; saveSync();
+      if (data.length < 500) break;
     }
-    const cache = {};
-    while (syncSt.dirty.length) {
-      const key = syncSt.dirty.shift(); // removed first: a change made during upload re-marks the key
-      try { await prov(c).put(c, `data/${key}.json`, await buildFile(key, cache)); done++; uiSync(); }
-      catch (e) { if (!syncSt.dirty.includes(key)) syncSt.dirty.push(key); throw e; }
-    }
-    if (done || manual) await prov(c).put(c, 'data/manifest.json', JSON.stringify({ app: 'epos', v: 1, deviceId: syncSt.deviceId, ts: Date.now() }));
-    syncSt.last = Date.now();
-  } catch (e) { syncSt.err = e.message || 'Backup failed'; if (manual) toast('Backup failed: ' + syncSt.err, true); }
-  finally { syncBusy = false; saveSync(); uiSync(); if (view === 'dash') { const b = $('#cloudBanner'); if (b) b.outerHTML = cloudBanner(); } }
+    syncSt.lastPull = Date.now();
+  } finally { pullBusy = false; }
+  return n;
+}
+async function syncFlush(o = {}) {
+  if (syncBusy || !sb || !syncSt) return false;
+  if (!navigator.onLine) { uiSync(); return false; }
+  if (!(await shopSession())) { syncSt.err = 'Shop sign-in expired — reconnect this device'; uiSync(); return false; }
+  syncBusy = true; syncSt.err = ''; uiSync();
+  try { await syncPush(); if (o.pull || !sbLive) await syncPull(); syncSt.last = Date.now(); }
+  catch (e) { syncSt.err = e.message || 'Sync failed'; if (o.manual) toast('Sync failed: ' + syncSt.err, true); }
+  finally { syncBusy = false; saveSync(); uiSync(); if (!syncSt.err && syncSt.dirty.length) scheduleSync(); }
   return !syncSt.err;
 }
-const timeAgo = ts => { const m = Math.round((Date.now() - ts) / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : m < 1440 ? Math.round(m / 60) + ' h ago' : Math.round(m / 1440) + ' d ago'; };
+function sbSubscribe() {
+  if (sbChan || !sb) return;
+  sbChan = sb.channel('epos-docs').on('postgres_changes', { event: '*', schema: 'public', table: 'docs' }, p => {
+    const r = p.new; if (!r || !r.store) return;
+    if (r.data === undefined && !r.del) { syncPull().catch(() => {}); return; } // very large record: fetch it normally
+    pendingRT.push(r); clearTimeout(rtT); rtT = setTimeout(() => applyRemote(pendingRT.splice(0)).catch(() => {}), 150);
+  }).subscribe(st => { sbLive = st === 'SUBSCRIBED'; if (sbLive) syncPull().catch(() => {}); uiSync(); });
+}
+async function sbStart() { // called after someone signs in to the app
+  if (!sbClient() || !syncSt || !(await shopSession())) return;
+  if (!syncSt.seeded) { syncSt.seeded = true; if (!syncSt.srv) await markAllDirty(); } // first device on an empty shop database uploads what it has; a device that just downloaded the shop data does not
+  sbSubscribe(); syncFlush({ pull: true });
+}
+
+/* ---------- connecting a device to the shop ---------- */
+function showShopLogin(msg) {
+  $('.app').classList.add('locked'); me = null; db = null; dek = null;
+  $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Connect to your shop</h1><p>Sign in with the shop account once on this device.<br>After that every device stays in sync, live.</p>
+    <div class="loginform"><label class="fld">Shop email<input id="shEmail" type="email" autocomplete="username" value="${esc(localStorage.getItem('epos.shopEmail') || '')}"></label>
+      <label class="fld">Shop password<input id="shPw" type="password" autocomplete="current-password"></label>
+      <div class="err" id="shErr">${esc(msg || '')}</div><button class="btn pri big" data-act="shopIn">Connect</button></div></div>`;
+}
+async function shopIn() {
+  const email = ($('#shEmail').value || '').trim(), password = $('#shPw').value, err = $('#shErr'); if (!email || !password) { err.textContent = 'Enter the shop email and password'; return; }
+  if (!sbClient()) { err.textContent = 'Sync library missing — reload the app'; return; }
+  err.textContent = 'Connecting…';
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) { err.textContent = /invalid/i.test(error.message) ? 'Wrong email or password' : error.message; return; }
+  try { localStorage.setItem('epos.shopEmail', email); localStorage.setItem('epos.shop', '1'); } catch (e) {}
+  err.textContent = 'Loading shop data…';
+  try { const n = await syncPull(); if (n > 0) syncSt.seeded = true; } catch (e) { err.textContent = 'Could not load data: ' + e.message; return; }
+  sbSubscribe(); meta && meta.users && meta.users.length ? showLogin() : showSetup();
+}
+async function shopOut() {
+  if (!confirm('Disconnect this device from the shop? Unsent changes are sent first. You must sign in to the shop again to use the app.')) return;
+  try { await syncFlush({ manual: true }); } catch (e) {}
+  try { await sb.auth.signOut(); localStorage.removeItem('epos.shop'); } catch (e) {}
+  location.reload();
+}
+
+/* ---------- status shown in Settings and on the dashboard ---------- */
+const syncState = () => syncSt.err ? ['bad', 'Sync problem'] : !navigator.onLine ? ['', 'Offline — changes will be sent later'] : syncBusy ? ['on', 'Syncing…'] : syncSt.dirty.length ? ['on', 'Sending changes…'] : sbLive ? ['on', 'Live'] : ['', 'Connecting…'];
+function uiSync() { const el = $('#cloudStat'); if (el) el.innerHTML = cloudStatHtml(); }
 function cloudStatHtml() {
-  if (!cloudCfg) return '<span><span class="dot"></span>Not set up</span><span style="margin-left:auto;color:var(--l2)">Your data exists only on this tablet</span>';
-  const s = syncSt, bad = !!s.err;
-  return `<span><span class="dot ${bad ? '' : 'on'}" style="${bad ? 'background:var(--red)' : ''}"></span>${syncBusy ? 'Backing up…' : bad ? 'Backup problem' : s.needAuth && s.dirty.length ? 'Tap anywhere to reconnect Google' : s.dirty.length ? 'Changes pending' : 'Up to date'}</span>
-    <span style="margin-left:auto;text-align:right;color:var(--l2);font-size:14px">${cloudLabel()} · ${s.last ? timeAgo(s.last) : 'not yet'}${s.dirty.length ? ` · ${s.dirty.length} pending` : ''}${bad ? `<br><b style="color:var(--red)">${esc(s.err)}</b>` : ''}</span>`;
+  const s = syncSt, [c, t] = syncState();
+  return `<span><span class="dot ${c === 'on' ? 'on' : ''}" style="${c === 'bad' ? 'background:var(--red)' : ''}"></span>${t}</span>
+    <span style="margin-left:auto;text-align:right;color:var(--l2);font-size:14px">${esc(localStorage.getItem('epos.shopEmail') || '')} · ${s.last ? timeAgo(s.last) : 'not yet'}${s.dirty.length ? ` · ${s.dirty.length} pending` : ''}${s.err ? `<br><b style="color:var(--red)">${esc(s.err)}</b>` : ''}</span>`;
 }
 function cloudBanner() {
-  if (!isAdmin() || !syncSt) return '<span id="cloudBanner"></span>';
-  const stale = cloudCfg && (!syncSt.last || Date.now() - syncSt.last > 3 * DAY);
-  if (cloudCfg && !syncSt.err && !stale) return '<span id="cloudBanner"></span>';
-  const msg = !cloudCfg ? 'Protect your data: set up automatic cloud backup so it survives a lost or broken tablet.' : syncSt.err ? 'Cloud backup problem: ' + syncSt.err : 'No cloud backup in the last 3 days.';
-  return `<button id="cloudBanner" class="card" data-act="nav" data-v="settings" style="width:100%;text-align:left;margin-bottom:12px;display:flex;gap:10px;align-items:center;border:1px solid ${cloudCfg ? 'var(--red)' : 'var(--orange)'}">${ICON.lock}<span style="flex:1"><b>Cloud backup</b><br><small style="color:var(--l2)">${esc(msg)}</small></span><span style="color:var(--tint);font-weight:600">${cloudCfg ? 'Fix' : 'Set up'} ›</span></button>`;
+  if (!isAdmin() || !syncSt || !syncSt.err) return '<span id="cloudBanner"></span>';
+  return `<button id="cloudBanner" class="card" data-act="nav" data-v="settings" style="width:100%;text-align:left;margin-bottom:12px;display:flex;gap:10px;align-items:center;border:1px solid var(--red)">${ICON.lock}<span style="flex:1"><b>Shop sync</b><br><small style="color:var(--l2)">${esc(syncSt.err)}</small></span><span style="color:var(--tint);font-weight:600">Fix ›</span></button>`;
 }
-const cloudLabel = () => cloudCfg.provider === 'google' ? 'Google Drive' + (cloudCfg.account ? ' · ' + esc(cloudCfg.account) : '') : `GitHub ${esc(cloudCfg.owner)}/${esc(cloudCfg.repo)}`;
-function cloudForm(c, restore) {
-  const f = (l, k, ex = '') => `<label class="frow"><span>${l}</span><input id="cl_${k}" value="${esc(c[k] || '')}" autocomplete="off" ${ex}></label>`;
-  return `<div class="group">${f('GitHub user', 'owner', 'placeholder="e.g. WayanSumalya"')}${f('Repository', 'repo', 'placeholder="e.g. pos-backup"')}${f('Branch', 'branch', 'placeholder="main"')}${f('Access token', 'token', 'type="password" placeholder="github_pat_…"')}</div>`;
-}
-const readCloud = () => ({ provider: 'github', owner: $('#cl_owner').value.trim(), repo: $('#cl_repo').value.trim(), branch: $('#cl_branch').value.trim() || 'main', token: $('#cl_token').value.trim(), auto: true });
-/* the simple, one-click screens */
-function cloudSheet() {
-  loadGis().catch(() => {}); // preload so the Google popup opens right after the tap
-  modal(`<h2>Cloud backup</h2><div class="sub">Automatic encrypted backup, so your data survives a broken or lost tablet</div>
-    <button class="btn pri big" data-act="gConnect" data-mode="backup">Connect Google Drive</button>
-    <div class="gf" style="text-align:center">Choose your Google account and tap Allow. Backups then run by themselves into a hidden, private app folder in your Drive — it does not appear in your files and uses almost no space.</div>
-    ${cloudCfg ? '<button class="btn dng" data-act="cloudOff">Turn off backup</button>' : ''}
-    <button class="btn" data-act="cloudAdv">Use a GitHub repository instead (advanced)</button><button class="btn" data-act="close">Cancel</button>`);
-}
-function gKeySheet(mode) {
-  modal(`<h2>One-time Google setup</h2><div class="sub">The shop owner does this once for the whole app</div>
-    <div class="gf">1) Open <b>console.cloud.google.com</b> → create a project (e.g. “EPOS”).<br>2) <b>APIs & Services → Library</b> → enable <i>Google Drive API</i>.<br>3) <b>OAuth consent screen</b> (Google Auth platform): type <i>External</i>, app name EPOS, your e-mail. Add the scope <i>…/auth/drive.appdata</i>. Then <b>Publish app</b> (“In production”) so the permission never expires.<br>4) <b>Credentials → Create credentials → OAuth client ID → Web application</b>. Under <i>Authorized JavaScript origins</i> add <b>${esc(location.origin)}</b> (no path). Create.<br>5) Copy the <b>Client ID</b> (ends with .apps.googleusercontent.com) and paste it here.</div>
-    <div class="group"><label class="frow"><span>Client ID</span><input id="gKeyIn" autocomplete="off" placeholder="…apps.googleusercontent.com"></label></div>
-    <button class="btn pri big" data-act="gKeySave" data-mode="${mode}">Save & continue</button><button class="btn" data-act="${mode === 'restore' && !me ? 'restoreCloudBack' : 'close'}">Cancel</button>`, 'wide');
-}
-async function gConnect(mode) {
-  if (mode === 'backup' && !isAdmin()) return toast('Administrator only', true);
-  const key = gKey(); if (!key) return gKeySheet(mode);
-  toast('Opening Google…');
-  try {
-    await gToken(key, null, true);
-    let email = ''; try { email = (await (await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + gMem.tok } })).json()).email || ''; } catch (e) {}
-    const c = { provider: 'google', key, account: email, auto: true };
-    if (mode === 'restore') {
-      toast('Restoring from Google Drive…'); await cloudRestore(c);
-      cart = []; lastUser = null; cloudCfg = null; closeModal(); toast('Restored — please sign in'); return showLogin();
-    }
-    if (!cloudCfg || cloudCfg.provider !== 'google') { syncSt.adopted = false; syncSt.shas = {}; syncSt.ids = null; }
-    await GDR.test(); db.settings.cloud = c; cloudCfg = c; saveVault(); await markAllDirty(); closeModal(); logEv('cloud', 'Cloud backup connected to Google Drive'); render();
-    toast('Backing up…'); const ok = await syncFlush(c, true); if (ok) toast('Cloud backup is on ✓'); render();
-  } catch (e) { toast(e.message, true); }
-}
-function githubSheet() {
-  modal(`<h2>GitHub backup (advanced)</h2><div class="sub">Encrypted copies in a <b>private</b> GitHub repository</div>${cloudForm(cloudCfg && cloudCfg.provider === 'github' ? cloudCfg : { branch: 'main' })}
-    <div class="gf">1) Create a new <b>private</b> repository (tick “Add a README”). Do <b>not</b> use the public POS repository.<br>2) GitHub → Settings → Developer settings → Fine-grained tokens → Generate: select <i>only</i> that repository, permission <i>Contents: Read and write</i>.<br>3) Paste the token above. The token is stored encrypted on this tablet only.</div>
-    <button class="btn pri big" data-act="cloudSave">Connect & back up</button>${cloudCfg ? '<button class="btn dng" data-act="cloudOff">Turn off & remove token</button>' : ''}<button class="btn" data-act="close">Cancel</button>`, 'wide');
-}
-async function cloudSave() {
-  const c = readCloud(); if (!c.owner || !c.repo || !c.token) return toast('Fill in user, repository and token', true);
-  toast('Checking…'); try { await cloudTest(c); } catch (e) { return toast(e.message, true); }
-  const changed = !cloudCfg || cloudCfg.owner !== c.owner || cloudCfg.repo !== c.repo; if (changed) { syncSt.adopted = false; syncSt.shas = {}; }
-  db.settings.cloud = c; cloudCfg = c; saveVault(); await markAllDirty(); closeModal(); render(); logEv('cloud', `Cloud backup connected to ${c.owner}/${c.repo}`);
-  toast('Backing up…'); const ok = await syncFlush(c, true); if (ok) toast('Cloud backup complete ✓'); render();
-}
-async function cloudRestore(c, progress) {
-  const P = prov(c), files = await P.list(c);
-  if (!files.some(f => f.path === 'data/meta.json') || !files.some(f => f.path === 'data/vault.json')) throw new Error('No EPOS backup found here');
-  const got = {}, q = [...files]; let n = 0;
-  const worker = async () => { while (q.length) { const f = q.shift(); got[f.path] = JSON.parse(await P.get(c, f.path), rev); progress && progress(++n, files.length); } };
-  await Promise.all([worker(), worker(), worker(), worker()]);
-  const rows = {}; DOCS.forEach(s => rows[s] = []);
-  Object.entries(got).forEach(([p, arr]) => { const st = p.split('/')[1]; if (rows[st] && Array.isArray(arr)) rows[st].push(...arr); });
-  await IDB.tx(['kv', 'vault', ...DOCS], t => {
-    t.objectStore('kv').put(got['data/meta.json'], 'users'); t.objectStore('vault').put(got['data/vault.json'], 'main');
-    DOCS.forEach(s => { const o = t.objectStore(s); o.clear(); rows[s].forEach(x => o.put(x)); });
-  });
-  const man = got['data/manifest.json'];
-  syncSt = { deviceId: (man && man.deviceId) || uid(), shas: Object.fromEntries(files.map(f => [f.path, f.sha])), dirty: [], last: Date.now(), err: '', adopted: true };
-  await IDB.put('kv', syncSt, 'sync'); meta = got['data/meta.json'];
-}
-function cloudRestoreSheet(fromSetup) {
-  modal(`<h2>Restore from cloud</h2><div class="sub">${fromSetup ? 'Use this on a new or reset tablet' : 'This replaces ALL data on this tablet'}</div>
-    <button class="btn pri big" data-act="gConnect" data-mode="restore">Restore from Google Drive</button>
-    <div class="gf" style="text-align:center">Sign in to the same Google account used for the backup. Then sign in to EPOS with your administrator password.</div>
-    <button class="btn" data-act="githubRestore" data-setup="${fromSetup ? 1 : ''}">Restore from GitHub (advanced)</button><button class="btn" data-act="${fromSetup ? 'restoreCloudBack' : 'close'}">Cancel</button>`);
-}
-function githubRestoreSheet(fromSetup) {
-  modal(`<h2>Restore from GitHub</h2><div class="sub">${fromSetup ? 'Use this on a new or reset tablet' : 'This replaces ALL data on this tablet'}</div>${cloudForm(cloudCfg && cloudCfg.provider === 'github' ? cloudCfg : { branch: 'main' })}
-    <div class="gf" id="clProg">Use the same repository and a token with read access. Sign in afterwards with your administrator password. Cashiers get a new PIN from the administrator.</div>
-    <button class="btn pri big" data-act="cloudDoRestore" data-setup="${fromSetup ? 1 : ''}">Restore</button><button class="btn" data-act="${fromSetup ? 'restoreCloudBack' : 'close'}">Cancel</button>`, 'wide');
-}
-async function cloudDoRestore(fromSetup) {
-  if (!fromSetup && !isAdmin()) return toast('Administrator only', true);
-  const c = readCloud(); if (!c.owner || !c.repo || !c.token) return toast('Fill in user, repository and token', true);
-  if (!fromSetup && !confirm('Replace ALL data on this tablet with the cloud backup?')) return;
-  const p = $('#clProg'); try { await cloudRestore(c, (n, t) => { if (p) p.textContent = `Downloading ${n} / ${t}…`; }); } catch (e) { return toast('Restore failed: ' + e.message, true); }
-  cart = []; lastUser = null; closeModal(); cloudCfg = null; toast('Restored — please sign in'); showLogin();
-}
-// Google access lasts 1 hour: renew it on the next tap (a tap is required for Google's small popup)
-document.addEventListener('click', () => {
-  const c = cloudCfg; if (!c || c.provider !== 'google' || !syncSt || !syncSt.dirty.length || Date.now() < gMem.exp || Date.now() - gLastTry < 120000 || syncBusy) return;
-  gRefresh().then(ok => ok && syncFlush(c));
-}, true);
-document.addEventListener('visibilitychange', () => { if (document.hidden && cloudCfg && syncSt && syncSt.dirty.length) syncFlush(cloudCfg); });
-addEventListener('online', () => { if (cloudCfg && syncSt && syncSt.dirty.length) syncFlush(cloudCfg); });
-setInterval(() => { if (cloudCfg && cloudCfg.auto !== false && syncSt && syncSt.dirty.length && !syncSt.paused) syncFlush(cloudCfg); }, 300000);
+document.addEventListener('visibilitychange', () => { if (syncSt && sb && me && !document.hidden) syncFlush({ pull: true }); });
+addEventListener('online', () => { if (syncSt && sb && me) syncFlush({ pull: true }); uiSync(); });
+addEventListener('offline', uiSync);
+setInterval(() => { if (syncSt && sb && me && !sbLive) syncFlush({ pull: true }); }, 30000); // safety net if the live connection drops
 
-const ADMIN_ONLY = new Set(['dp', 'repPrint', 'repCsv', 'repCsv2', 'pickImg', 'rmImg', 'sf', 'sadj', 'edit', 'newProd', 'saveProd', 'delProd', 'void', 'export', 'csv', 'import', 'reset', 'userNew', 'userEdit', 'saveUser', 'removeUser', 'urole', 'log']);
-const ADMIN_RE = /^(cloud(Setup|Save|Off|Now|Restore|Overwrite|Adv)|scan(Sku|Inv|Count|Po|Rcv)|po[A-Z]|sup|cnt|rc|grn|newPo|newCount|startCount|itab|openPo|pickLogo|rmLogo|custEdit|custAdj|custDel|custCsv)/;
+const ADMIN_ONLY = new Set(['dp', 'repPrint', 'repCsv', 'repCsv2', 'pickImg', 'rmImg', 'sf', 'sadj', 'edit', 'newProd', 'saveProd', 'delProd', 'void', 'export', 'csv', 'import', 'reset', 'userNew', 'userEdit', 'saveUser', 'removeUser', 'urole', 'log', 'shopOut', 'syncNow']);
+const ADMIN_RE = /^(scan(Sku|Inv|Count|Po|Rcv)|po[A-Z]|sup|cnt|rc|grn|newPo|newCount|startCount|itab|openPo|pickLogo|rmLogo|custEdit|custAdj|custDel|custCsv)/;
 const A = {
   nav: d => { view = d.v; render(); },
   cat: d => { cat = d.c; updateGrid(); },
@@ -1487,13 +1442,13 @@ const A = {
   void: d => {
     const s = db.sales.find(x => x.id === d.id);
     if (!confirm(`Void ${s.no} and return items to stock? This cannot be undone.`)) return;
-    s.void = true; saveSale(s); s.items.forEach(i => { const p = prod(i.id); if (p && p.stock !== null) { p.stock += i.qty; saveProduct(p); } });
+    s.void = true; saveSale(s); s.items.forEach(i => { const p = prod(i.id); if (p && p.stock !== null) setStock(p, p.stock + i.qty); });
     const vc = s.customerId && cust(s.customerId); // reverse loyalty effects
     if (vc && s.pts) { vc.points = Math.max(0, vc.points - s.pts.earned + s.pts.used); vc.spent = r2(Math.max(0, (vc.spent || 0) - s.total)); vc.visits = Math.max(0, (vc.visits || 0) - 1); persist('customers', vc); }
     logEv('void', `Voided ${s.no} (${money(s.total)})`); closeModal(); render(); toast('Sale voided');
   },
   sf: d => { stockF = d.f; render(); }, salf: d => { salesF = d.f; render(); },
-  sadj: d => { const p = prod(d.id), n = p.stock + +d.d; if (n < 0) return; logEv('stock', `${p.name}: stock ${p.stock} → ${n}`); p.stock = n; saveProduct(p); updateStock(); },
+  sadj: d => { const p = prod(d.id), n = p.stock + +d.d; if (n < 0) return; logEv('stock', `${p.name}: stock ${p.stock} → ${n}`); setStock(p, n); updateStock(); },
   pickImg: () => $('#imgFile').click(),
   rmImg: () => { imgDraft = null; const n = ($('#fName') || {}).value || 'x'; $('#pPrev').innerHTML = esc(($('#fIcon').value || n)[0].toUpperCase()); },
   edit: d => productForm(prod(d.id)), newProd: () => productForm(null), saveProd: d => saveProd(d.id),
@@ -1507,23 +1462,10 @@ const A = {
   changeOwn: () => ownSecretSheet(), saveOwn: () => saveOwn(), log: () => logSheet(),
   lock: () => lock(),
   checkUpdate: () => checkUpdate(false), applyUpdate: () => applyUpdate(),
-  /* cloud backup */
-  cloudSetup: () => cloudSheet(),
-  cloudAdv: () => githubSheet(),
-  gConnect: d => { if (d.mode === 'restore' && me && !confirm('Replace ALL data on this tablet with the cloud backup?')) return; gConnect(d.mode); },
-  gKeySave: d => { const k = $('#gKeyIn').value.trim(); if (!/.apps.googleusercontent.com$/.test(k)) return toast('That does not look like a Google Client ID', true); localStorage.setItem('epos.gkey', k); if (meta && me) { meta.gKey = k; saveMeta(); } gConnect(d.mode); },
-  githubRestore: d => githubRestoreSheet(!!d.setup),
-  cloudSave: () => cloudSave(),
-  cloudOff: () => { if (!confirm('Turn off cloud backup and remove the token from this tablet? Existing cloud files are kept.')) return; delete db.settings.cloud; cloudCfg = null; saveVault(); closeModal(); logEv('cloud', 'Cloud backup turned off'); render(); },
-  cloudNow: () => {
-    if (!cloudCfg) return cloudSheet();
-    if (syncSt.paused && !confirm('This repository holds a backup from another device. Overwrite it with the data on this tablet?')) return;
-    if (syncSt.paused) { syncSt.adopted = true; syncSt.paused = false; markAllDirty(); }
-    gRefresh().then(ok => ok && syncFlush(cloudCfg, true)).then(ok => { if (ok) toast('Cloud backup complete ✓'); });
-  },
-  cloudRestore: () => askSecret('Restore from cloud', 'This replaces all data on this tablet. Enter your password to continue.', () => cloudRestoreSheet(false)),
-  cloudDoRestore: d => cloudDoRestore(!!d.setup),
-  restoreCloud: () => cloudRestoreSheet(true), restoreCloudBack: () => { closeModal(); showSetup(); },
+  /* shop sync */
+  shopIn: () => shopIn(),
+  syncNow: () => { toast('Syncing…'); syncFlush({ manual: true, pull: true }).then(ok => { if (ok) toast('Everything is up to date ✓'); }); },
+  shopOut: () => shopOut(),
   /* camera scanner */
   scanSell: () => openScanner({ title: 'Scan items', continuous: true, onCode: scanHandlers.sell }),
   scanSku: () => openScanner({ title: 'Scan item barcode', onCode: scanHandlers.sku }),
@@ -1669,7 +1611,6 @@ document.addEventListener('change', e => {
     const k = t.dataset.set; S()[k] = t.type === 'checkbox' ? t.checked : ['dec', 'tax', 'paper', 'cashDiscMax', 'earnPer', 'ptValue', 'minRedeem'].includes(k) ? +t.value || 0 : t.value; saveVault();
     if (k === 'store') { meta.store = t.value; saveMeta(); }
     if (['method', 'paper', 'dec', 'cur', 'store', 'loyaltyOn', 'earnPer', 'ptValue'].includes(k)) render();
-  } else if (t.dataset.cloud === 'auto' && isAdmin() && cloudCfg) { cloudCfg.auto = t.checked; db.settings.cloud = cloudCfg; saveVault(); if (t.checked && syncSt.dirty.length) scheduleSync();
   } else if (t.dataset.meta && isAdmin()) { meta[t.dataset.meta] = +t.value; saveMeta(); bump(); }
 });
 $('#imgFile').addEventListener('change', async e => {
@@ -1694,8 +1635,16 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) close
 /* ---------- boot ---------- */
 (async function boot() {
   if (!window.crypto || !crypto.subtle) { $('#main').innerHTML = '<div class="empty">A secure (HTTPS) connection is required.<br>Open the app from its https:// address.</div>'; return; }
-  try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), shas: {}, dirty: [], last: 0, err: '', adopted: false }; syncSt.err = ''; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
-  meta && meta.users && meta.users.length ? showLogin() : showSetup();
+  try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), dirty: [], last: 0, err: '', srv: '', seeded: false }; syncSt.err = ''; syncSt.dirty = syncSt.dirty || []; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
+  sbClient(); const has = () => meta && meta.users && meta.users.length;
+  let signed = !!(await shopSession());
+  if (!signed && has() && !navigator.onLine) signed = true;            // offline start of a device that already holds the data
+  if (!signed && !has() && localStorage.getItem('epos.shop') && !navigator.onLine) { $('#main').innerHTML = '<div class="empty">No internet.<br>Connect once to load the shop data.</div>'; return; }
+  if (!signed) showShopLogin(has() ? 'Sign in to the shop once to turn on live sync for this device.' : '');
+  else {
+    if (!has() && navigator.onLine) { try { await syncPull(); } catch (e) { return showShopLogin('Could not load shop data: ' + e.message); } }
+    sbSubscribe(); has() ? showLogin() : showSetup();
+  }
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
 })();
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
