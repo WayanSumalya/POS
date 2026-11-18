@@ -307,7 +307,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.18-18';
+const APP_VERSION = '2026.11.18-19';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
@@ -1429,7 +1429,17 @@ function showShopLogin(msg) {
   $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Connect to your shop</h1><p>Sign in with the shop account once on this device.<br>After that every device stays in sync, live.</p>
     <div class="loginform"><label class="fld">Shop email<input id="shEmail" type="email" autocomplete="username" value="${esc(localStorage.getItem('epos.shopEmail') || '')}"></label>
       <label class="fld">Shop password<input id="shPw" type="password" autocomplete="current-password"></label>
-      <div class="err" id="shErr">${esc(msg || '')}</div><button class="btn pri big" data-act="shopIn">Connect</button></div></div>`;
+      <div class="err" id="shErr">${esc(msg || '')}</div><button class="btn pri big" data-act="shopIn">Connect</button>
+      <button class="back" data-act="shopForgot" style="margin-top:12px">Forgot shop password?</button></div></div>`;
+}
+async function shopForgot() {
+  const email = ($('#shEmail').value || '').trim(), err = $('#shErr');
+  if (!email) { err.textContent = 'Enter the shop email first, then tap “Forgot shop password?”'; return; }
+  if (!navigator.onLine) { err.textContent = 'No internet connection'; return; }
+  if (!sbClient()) { err.textContent = 'Sync library missing — reload the app'; return; }
+  err.textContent = 'Sending…';
+  const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname });
+  err.textContent = error ? error.message : 'Reset link sent. Open the email on this device and tap the link.';
 }
 async function shopIn() {
   const email = ($('#shEmail').value || '').trim(), password = $('#shPw').value, err = $('#shErr'); if (!email || !password) { err.textContent = 'Enter the shop email and password'; return; }
@@ -1526,7 +1536,7 @@ const A = {
   lock: () => lock(),
   checkUpdate: () => checkUpdate(false), applyUpdate: () => applyUpdate(),
   /* shop sync */
-  shopIn: () => shopIn(), setShopPw: () => setShopPw(),
+  shopIn: () => shopIn(), shopForgot: () => shopForgot(), setShopPw: () => setShopPw(),
   syncNow: () => { toast('Syncing…'); syncFlush({ manual: true, pull: true }).then(ok => { if (ok) toast('Everything is up to date ✓'); }); },
   shopOut: () => shopOut(),
   /* camera scanner */
