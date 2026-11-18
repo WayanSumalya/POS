@@ -108,7 +108,7 @@ const encObj = async o => JSON.parse(JSON.stringify(o));
 const decObj = async d => d instanceof Uint8Array ? JSON.parse(td.decode(await unseal(dek, d))) : d;
 async function makeUser(name, role, secret, raw) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  return { id: uid(), name, role, salt, wrap: await seal(await deriveKey(secret, salt), raw), created: Date.now(), fails: 0, until: 0 };
+  return { id: uid(), name, role, salt, wrap: await seal(await deriveKey(secret, salt), raw), created: Date.now(), credUpd: Date.now(), fails: 0, until: 0 };
 }
 async function tryUnwrap(u, secret) { try { return await unseal(await deriveKey(secret, u.salt), u.wrap); } catch (e) { return null; } }
 const validSecret = (role, s) => role === 'admin' ? (s.length >= 8 ? '' : 'Password must be at least 8 characters') : (/^\d{6}$/.test(s) ? '' : 'PIN must be exactly 6 digits');
@@ -118,7 +118,11 @@ async function persist(store, obj) { const k = dek; if (!k) return; try { await 
 const saveProduct = p => persist('products', p.stock === null ? p : { ...p, stock: 0 }); // stock itself is the sum of its moves, never stored in the product
 const saveSale = s => persist('sales', s);
 async function saveVault() { const k = dek; if (!k || !db) return; try { await IDB.put('vault', { d: await encObj({ settings: db.settings, seq: db.seq }, k), upd: Date.now() }, 'main'); markDirty('vault'); } catch (e) { fail(); } }
-const saveMeta = () => { meta.upd = Date.now(); return IDB.put('kv', meta, 'users').then(() => markDirty('meta')).catch(fail); };
+// local=true: per-device data only (login lockout counters) — not shared, does not touch the shared change time
+const saveMeta = (local) => {
+  if (!local) meta.upd = Date.now();
+  return IDB.put('kv', meta, 'users').then(() => { if (!local) { markDirty('meta'); meta.users.forEach(u => markDirty('creds/' + u.id)); } }).catch(fail);
+};
 function logEv(type, text) { if (!db) return; const e = { id: uid(), ts: Date.now(), type, text, user: me ? me.name : '', dev: devId() }; db.log.unshift(e); persist('log', e); }
 async function fullSave() {
   DOCS.forEach(n => { db[n] = db[n] || []; });
@@ -230,6 +234,7 @@ function renderLogin() {
     return;
   }
   if (u.needsReset) { m.innerHTML = `<div class="login">${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1><p>This PIN was not part of the cloud backup.<br>Ask an administrator to set a new PIN.</p><button class="back" data-act="pick" data-id="">‹ Switch account</button></div>`; return; }
+  if (!u.wrap) { m.innerHTML = `<div class="login">${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1><p>This sign-in is not available on this device.<br>${u.role === 'admin' ? 'Administrators sign in on a device connected with the admin shop account.' : 'Wait for sync to finish, then try again.'}</p><button class="back" data-act="pick" data-id="">‹ Switch account</button></div>`; return; }
   const wait = Math.ceil((u.until - Date.now()) / 1000), head = `${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1>`;
   const msg = wait > 0 ? `Too many attempts. Try again in ${wait}s` : L.busy ? 'Unlocking…' : esc(L.err);
   if (u.role === 'admin') {
@@ -253,7 +258,7 @@ async function tryLogin(u, secret) {
     u.fails = (u.fails || 0) + 1;
     if (u.fails >= 5) u.until = Date.now() + Math.min(30000 * 2 ** (u.fails - 5), 900000);
     meta.fails = [{ ts: Date.now(), user: u.name }, ...(meta.fails || [])].slice(0, 30);
-    await saveMeta(); L.busy = false; L.pin = ''; L.err = u.role === 'admin' ? 'Incorrect password' : 'Incorrect PIN';
+    await saveMeta(true); L.busy = false; L.pin = ''; L.err = u.role === 'admin' ? 'Incorrect password' : 'Incorrect PIN';
     renderLogin(); const d = $('#dots'); if (d) d.classList.add('shake');
     if (u.until > Date.now()) { const t = setInterval(() => { if (!L.sel || u.until <= Date.now()) { clearInterval(t); } if (!me) renderLogin(); }, 1000); }
     return;
@@ -261,7 +266,7 @@ async function tryLogin(u, secret) {
   try {
     dek = await sub.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
     dekRaw = u.role === 'admin' ? raw : null;
-    u.fails = 0; u.until = 0; await saveMeta();
+    u.fails = 0; u.until = 0; await saveMeta(true);
     me = { id: u.id, name: u.name, role: u.role };
     await loadDb();
     if (lastUser !== me.id) { cart = []; custId = null; }
@@ -302,7 +307,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.18-16';
+const APP_VERSION = '2026.11.18-17';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
@@ -1186,7 +1191,7 @@ async function saveUser(id) {
   if (!u && meta.users.some(x => x.name.toLowerCase() === name.toLowerCase())) return toast('That name already exists', true);
   toast('Saving…');
   const nu = await makeUser(name, role, sec, dekRaw);
-  if (u) { Object.assign(u, { salt: nu.salt, wrap: nu.wrap, fails: 0, until: 0 }); delete u.needsReset; logEv('user', `Reset credentials for ${u.name}`); }
+  if (u) { Object.assign(u, { salt: nu.salt, wrap: nu.wrap, credUpd: Date.now(), fails: 0, until: 0 }); delete u.needsReset; logEv('user', `Reset credentials for ${u.name}`); }
   else { meta.users.push(nu); logEv('user', `Added ${role} ${name}`); }
   await saveMeta(); UF = { role: 'cashier' }; closeModal(); render(); toast('Saved');
 }
@@ -1195,7 +1200,7 @@ function removeUser(id) {
   if (!u || u.id === me.id) return;
   if (u.role === 'admin' && meta.users.filter(x => x.role === 'admin').length < 2) return toast('Keep at least one administrator', true);
   if (!confirm(`Remove ${u.name}? Their past sales stay in the history.`)) return;
-  meta.users = meta.users.filter(x => x.id !== id); saveMeta(); logEv('user', `Removed ${u.name}`); closeModal(); render();
+  meta.users = meta.users.filter(x => x.id !== id); markDirty('creds/' + id); saveMeta(); logEv('user', `Removed ${u.name}`); closeModal(); render();
 }
 function ownSecretSheet() {
   const pin = !isAdmin();
@@ -1210,7 +1215,7 @@ async function saveOwn() {
   const bad = validSecret(me.role, nw); if (bad) return toast(bad, true);
   if (nw !== $('#oNew2').value) return toast('Entries do not match', true);
   toast('Checking…'); const raw = await tryUnwrap(u, cur); if (!raw) return toast('Current ' + (pin() ? 'PIN' : 'password') + ' is wrong', true);
-  const nu = await makeUser(u.name, u.role, nw, raw); u.salt = nu.salt; u.wrap = nu.wrap; await saveMeta();
+  const nu = await makeUser(u.name, u.role, nw, raw); u.salt = nu.salt; u.wrap = nu.wrap; u.credUpd = Date.now(); await saveMeta();
   logEv('user', 'Changed own credentials'); closeModal(); toast('Updated');
   function pin() { return me.role !== 'admin'; }
 }
@@ -1247,7 +1252,7 @@ async function importBackup(file) {
       t.objectStore('kv').put(d.meta, 'users'); t.objectStore('vault').put(d.vault, 'main');
       DOCS.forEach(n => { const o = t.objectStore(n); o.clear(); (d[n] || []).forEach(x => o.put(x)); });
     });
-    meta = d.meta; cart = []; lastUser = null; markAllDirty(); toast('Backup restored — please sign in'); showLogin();
+    meta = d.meta; meta.upd = Date.now(); meta.users.forEach(u => { u.credUpd = Date.now(); }); await IDB.put('kv', meta, 'users'); cart = []; lastUser = null; markAllDirty(); toast('Backup restored — please sign in'); showLogin();
   } catch (e) { toast('Not a valid EPOS backup file', true); }
 }
 
@@ -1270,7 +1275,7 @@ const timeAgo = ts => { const m = Math.round((Date.now() - ts) / 60000); return 
 function saveSync() { clearTimeout(syncSaveT); syncSaveT = setTimeout(() => { if (syncSt) IDB.put('kv', syncSt, 'sync').catch(() => {}); }, 800); }
 function markDirty(key) { if (!syncSt) return; if (!syncSt.dirty.includes(key)) syncSt.dirty.push(key); saveSync(); scheduleSync(); }
 async function markAllDirty() {
-  if (!syncSt) return; const have = new Set(syncSt.dirty); have.add('meta'); have.add('vault');
+  if (!syncSt) return; const have = new Set(syncSt.dirty); have.add('meta'); have.add('vault'); ((meta && meta.users) || []).forEach(u => have.add('creds/' + u.id));
   for (const s of DOCS) (await IDB.all(s)).forEach(r => have.add(s + '/' + r.id));
   syncSt.dirty = [...have]; saveSync(); scheduleSync();
 }
@@ -1284,7 +1289,17 @@ async function shopSession() { try { const c = sbClient(); if (!c) return null; 
 
 /* ---------- local row <-> shared row ---------- */
 async function toRemote(key) {
-  if (key === 'meta') return meta ? { store: 'meta', id: 'main', data: jclean({ ...meta, fails: [] }), upd: meta.upd || 1, del: false } : null;
+  if (key === 'meta') { // shared copy never contains password/PIN verifiers
+    if (!meta) return null;
+    const users = meta.users.map(u => ({ id: u.id, name: u.name, role: u.role, avatar: u.avatar, created: u.created }));
+    return { store: 'meta', id: 'main', data: jclean({ ...meta, users, fails: [] }), upd: meta.upd || 1, del: false };
+  }
+  if (key.startsWith('creds/')) { // one row per user, so the server can hide administrator rows from cashier accounts
+    if (!meta) return null; const id = key.slice(6), u = meta.users.find(x => x.id === id);
+    if (!u) return { store: 'creds', id, data: null, upd: Date.now(), del: true };
+    if (!u.wrap) return null;
+    return { store: 'creds', id, data: jclean({ role: u.role, salt: u.salt, wrap: u.wrap }), upd: u.credUpd || 1, del: false };
+  }
   if (key === 'vault') { const v = await IDB.get('vault', 'main'); return v ? { store: 'vault', id: 'main', data: await decObj(v.d), upd: v.upd || 1, del: false } : null; }
   const i = key.indexOf('/'), store = key.slice(0, i), r = await IDB.get(store, key.slice(i + 1));
   return r ? { store, id: r.id, data: r.del ? null : await decObj(r.d), upd: r.upd || 0, del: !!r.del } : null;
@@ -1316,19 +1331,31 @@ async function mergeVault(data, upd) { // settings: newest wins, except this dev
   if (newer) { const s = { ...DEF, ...data.settings }; ['method', 'btId', 'btName', 'paper'].forEach(k => { if (db.settings[k] !== undefined) s[k] = db.settings[k]; }); db.settings = s; }
   db.seq = seq; await IDB.put('vault', { d: { settings: db.settings, seq }, upd: newer ? upd : (mine.upd || 0) }, 'main'); return 1;
 }
-async function mergeMeta(data, upd) { // people, logo, store name: newest wins; auto-lock stays per device
+/* Password / PIN verifiers (salt + wrap) travel as separate 'creds' rows. credStore keeps what arrived, even before the user list does. */
+let credStore = {};
+async function attachCreds() {
+  let ch = 0; if (!meta) return 0;
+  for (const u of meta.users) { const c = credStore[u.id]; if (c && c.wrap && (!u.wrap || c.upd > (u.credUpd || 0))) { u.salt = c.salt; u.wrap = c.wrap; u.credUpd = c.upd; delete u.needsReset; ch++; } }
+  try { await IDB.put('kv', credStore, 'creds'); if (ch) await IDB.put('kv', meta, 'users'); } catch (e) {}
+  return ch;
+}
+async function mergeMeta(data, upd) { // people, logo, store name: newest wins; auto-lock and login counters stay per device
   if (!data || (meta && (meta.upd || 0) >= upd)) return 0;
   const keep = meta ? { autoLock: meta.autoLock, lastBackup: meta.lastBackup, fails: meta.fails } : {};
-  meta = { ...data, ...keep, upd }; await IDB.put('kv', meta, 'users'); return 1;
+  const old = new Map(((meta && meta.users) || []).map(u => [u.id, u]));
+  const users = (data.users || []).map(ru => { const o = old.get(ru.id) || {}; return { ...ru, salt: o.salt || ru.salt, wrap: o.wrap || ru.wrap, credUpd: o.credUpd || 0, fails: o.fails || 0, until: o.until || 0 }; });
+  meta = { ...data, ...keep, users, upd }; await attachCreds(); await IDB.put('kv', meta, 'users'); return 1;
 }
 async function applyRemote(list) {
-  let n = 0; const by = {};
+  let n = 0, credGot = false; const by = {};
   for (const r of list) {
-    if (r.store === 'meta') n += await mergeMeta(r.data && jrestore(r.data), r.upd);
+    if (r.store === 'creds') { credGot = true; if (r.del || !r.data) delete credStore[r.id]; else { const d = jrestore(r.data); if (!credStore[r.id] || r.upd >= credStore[r.id].upd) credStore[r.id] = { salt: d.salt, wrap: d.wrap, role: d.role, upd: r.upd }; } }
+    else if (r.store === 'meta') n += await mergeMeta(r.data && jrestore(r.data), r.upd);
     else if (r.store === 'vault') n += await mergeVault(r.data && jrestore(r.data), r.upd);
     else if (DOCS.includes(r.store)) (by[r.store] = by[r.store] || []).push(fromRemote(r));
   }
   for (const s in by) n += await mergeRows(s, by[s]);
+  if (credGot) { n += await attachCreds(); }
   if (n && db) { recomputeStock(); queueRender(); }
   return n;
 }
@@ -1386,6 +1413,9 @@ function sbSubscribe() {
 }
 async function sbStart() { // called after someone signs in to the app
   if (!sbClient() || !syncSt || !(await shopSession())) return;
+  if (isAdmin() && !syncSt.credsSplit) { // one time: move verifiers out of the shared 'meta' row into 'creds' rows and overwrite the old shared copy
+    syncSt.credsSplit = true; meta.users.forEach(u => { u.credUpd = u.credUpd || 1; }); await saveMeta();
+  }
   if (!syncSt.seeded) { syncSt.seeded = true; if (!syncSt.srv) await markAllDirty(); } // first device on an empty shop database uploads what it has; a device that just downloaded the shop data does not
   sbSubscribe(); syncFlush({ pull: true });
 }
@@ -1646,7 +1676,7 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) close
 /* ---------- boot ---------- */
 (async function boot() {
   if (!window.crypto || !crypto.subtle) { $('#main').innerHTML = '<div class="empty">A secure (HTTPS) connection is required.<br>Open the app from its https:// address.</div>'; return; }
-  try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), dirty: [], last: 0, err: '', srv: '', seeded: false }; syncSt.err = ''; syncSt.dirty = syncSt.dirty || []; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
+  try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), dirty: [], last: 0, err: '', srv: '', seeded: false }; syncSt.err = ''; syncSt.dirty = syncSt.dirty || []; credStore = (await IDB.get('kv', 'creds')) || {}; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
   sbClient(); const has = () => meta && meta.users && meta.users.length;
   let signed = !!(await shopSession());
   if (!signed && has() && !navigator.onLine) signed = true;            // offline start of a device that already holds the data

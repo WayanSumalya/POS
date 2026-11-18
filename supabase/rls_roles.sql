@@ -29,9 +29,12 @@
 -- Writes a cashier is not allowed to make are silently skipped (not an error), so a cashier tablet
 -- never gets stuck on a sync error. An admin account can do everything. Nobody but admin can delete rows.
 --
--- KNOWN LIMIT: the cashier can still read the 'meta' row, which holds each user's salted PIN/password
--- verifier. Remove that from the shared data in a later step. Roles inside the app stay a convenience;
--- this file is the real wall.
+-- CREDENTIALS: app version 2026.11.18-17 and later keeps the PIN/password verifiers in separate 'creds' rows
+-- (not in 'meta'). Administrator rows are hidden from cashier accounts; cashier PIN rows stay readable by
+-- cashier accounts (6-digit PINs are weak, so treat them as a convenience, not a secret).
+-- Update every device to that version, and sign in once with the ADMIN shop account: the first admin sign-in
+-- uploads the 'creds' rows and overwrites the old shared 'meta' row (which used to contain the verifiers).
+-- Old copies of that row may still exist in Supabase backups/logs, so CHANGE THE ADMIN PASSWORD afterwards.
 
 create or replace function public.shop_role() returns text language sql stable as $$
   select coalesce(auth.jwt() -> 'app_metadata' ->> 'role', '')
@@ -45,7 +48,12 @@ drop policy if exists "docs read" on public.docs;
 drop policy if exists "docs insert" on public.docs;
 drop policy if exists "docs update" on public.docs;
 drop policy if exists "docs delete" on public.docs;
-create policy "docs read"   on public.docs for select to authenticated using (public.shop_role() in ('admin', 'cashier'));
+-- 'creds' rows hold each user's salted password/PIN verifier. A cashier account may only read the cashier ones
+-- (needed so a cashier can sign in on a tablet); administrator verifiers never leave an admin account.
+create policy "docs read"   on public.docs for select to authenticated using (
+  public.shop_role() = 'admin'
+  or (public.shop_role() = 'cashier' and (store <> 'creds' or data ->> 'role' = 'cashier'))
+);
 create policy "docs insert" on public.docs for insert to authenticated with check (public.shop_role() in ('admin', 'cashier'));
 create policy "docs update" on public.docs for update to authenticated using (public.shop_role() in ('admin', 'cashier')) with check (public.shop_role() in ('admin', 'cashier'));
 create policy "docs delete" on public.docs for delete to authenticated using (public.shop_role() = 'admin');
