@@ -1,10 +1,12 @@
 'use strict';
 /* ====================================================================
-   EPOS v2 — POS + inventory, roles (admin / cashier), encrypted storage
-   Security model (no server needed):
-   - A random 256-bit data key (DEK) encrypts every record with AES-GCM.
-   - Each user's password / PIN is stretched with PBKDF2 (310k rounds) into a key
-     that wraps the DEK. Without a valid login the stored data is unreadable.
+   EPOS v2 — POS + inventory, roles (admin / cashier), shared shop database
+   Security model:
+   - Records are stored as plain JSON on the device and in the shop's Supabase project.
+     They are NOT encrypted: protection is the shop account login + row-level security,
+     plus the device's own screen lock.
+   - Each user's password / PIN is stretched with PBKDF2 (310k rounds) and only gates the app screen.
+     Roles (admin / cashier) are enforced inside the app, not by the server.
    - 5 wrong attempts → progressive lockout. Auto-lock when idle. Activity log.
    ==================================================================== */
 const $ = s => document.querySelector(s);
@@ -18,10 +20,12 @@ const hue = s => { let h = 0; for (const c of String(s || '?')) h = (h * 31 + c.
 const initial = s => (String(s || '?').trim()[0] || '?').toUpperCase();
 const uById = id => (meta && meta.users.find(u => u.id === id)) || null;
 // avatar: user photo, otherwise a person icon (not initials)
-const avatar = (u, cls = '') => `<span class="av ${cls}${u && u.avatar ? ' ph' : ''}">${u && u.avatar ? `<img src="${u.avatar}" alt="">` : ICONS_PERSON}</span>`;
+// images arrive from the shared database: only accept real base64 image data (blocks attribute injection)
+const safeImg = v => typeof v === 'string' && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+\/=]+$/.test(v) ? v : '';
+const avatar = (u, cls = '') => `<span class="av ${cls}${safeImg(u && u.avatar) ? ' ph' : ''}">${safeImg(u && u.avatar) ? `<img src="${safeImg(u.avatar)}" alt="">` : ICONS_PERSON}</span>`;
 const ICONS_PERSON = '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>';
 // shop logo (stored unencrypted in meta so the lock screen can show it)
-const brandMark = (cls = '') => `<span class="logo ${cls}">${meta && meta.logo ? `<img src="${meta.logo}" alt="">` : ICON.logo}</span>`;
+const brandMark = (cls = '') => `<span class="logo ${cls}">${meta && safeImg(meta.logo) ? `<img src="${safeImg(meta.logo)}" alt="">` : ICON.logo}</span>`;
 
 /* ---------- state ---------- */
 let db = null;          // decrypted working data (only while unlocked)
@@ -65,7 +69,7 @@ const startOfDay = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), d
 const stockBadge = p => p.stock === null ? '' : p.stock <= 0 ? '<span class="badge out">Out</span>' : p.stock <= p.low ? `<span class="badge low">${p.stock} left</span>` : `<span class="badge">${p.stock}</span>`;
 
 /* ====================================================================
-   STORAGE (IndexedDB) + ENCRYPTION
+   STORAGE (IndexedDB) + PASSWORD LOGIN
    ==================================================================== */
 const DOCS = ['products', 'sales', 'log', 'suppliers', 'pos', 'counts', 'customers', 'grn', 'moves']; // 'moves' = stock changes (+/- amounts) so several devices can add up instead of overwriting each other
 const devId = () => ((typeof syncSt !== 'undefined' && syncSt && syncSt.deviceId) || 'x').slice(0, 6);
@@ -104,7 +108,7 @@ const encObj = async o => JSON.parse(JSON.stringify(o));
 const decObj = async d => d instanceof Uint8Array ? JSON.parse(td.decode(await unseal(dek, d))) : d;
 async function makeUser(name, role, secret, raw) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  return { id: uid(), name, role, salt, wrap: await seal(await deriveKey(secret, salt), raw), created: Date.now(), fails: 0, until: 0 };
+  return { id: uid(), name, role, salt, wrap: await seal(await deriveKey(secret, salt), raw), created: Date.now(), credUpd: Date.now(), fails: 0, until: 0 };
 }
 async function tryUnwrap(u, secret) { try { return await unseal(await deriveKey(secret, u.salt), u.wrap); } catch (e) { return null; } }
 const validSecret = (role, s) => role === 'admin' ? (s.length >= 8 ? '' : 'Password must be at least 8 characters') : (/^\d{6}$/.test(s) ? '' : 'PIN must be exactly 6 digits');
@@ -114,7 +118,11 @@ async function persist(store, obj) { const k = dek; if (!k) return; try { await 
 const saveProduct = p => persist('products', p.stock === null ? p : { ...p, stock: 0 }); // stock itself is the sum of its moves, never stored in the product
 const saveSale = s => persist('sales', s);
 async function saveVault() { const k = dek; if (!k || !db) return; try { await IDB.put('vault', { d: await encObj({ settings: db.settings, seq: db.seq }, k), upd: Date.now() }, 'main'); markDirty('vault'); } catch (e) { fail(); } }
-const saveMeta = () => { meta.upd = Date.now(); return IDB.put('kv', meta, 'users').then(() => markDirty('meta')).catch(fail); };
+// local=true: per-device data only (login lockout counters) — not shared, does not touch the shared change time
+const saveMeta = (local) => {
+  if (!local) meta.upd = Date.now();
+  return IDB.put('kv', meta, 'users').then(() => { if (!local) { markDirty('meta'); meta.users.forEach(u => markDirty('creds/' + u.id)); } }).catch(fail);
+};
 function logEv(type, text) { if (!db) return; const e = { id: uid(), ts: Date.now(), type, text, user: me ? me.name : '', dev: devId() }; db.log.unshift(e); persist('log', e); }
 async function fullSave() {
   DOCS.forEach(n => { db[n] = db[n] || []; });
@@ -148,6 +156,8 @@ function setStock(p, n) { // every stock change is recorded as +/- amount
   const d = n - (p.stock || 0); p.stock = n; if (!d) return;
   const m = { id: uid(), ts: Date.now(), pid: p.id, d, dev: devId() }; (db.moves = db.moves || []).push(m); persist('moves', m);
 }
+// short random per-device tag so two devices selling offline can never issue the same invoice number
+const devTag = () => String((syncSt && syncSt.deviceId) || 'x').slice(-3).toUpperCase().padStart(3, '0');
 const nextNo = (prefix, arr) => prefix + String(arr.reduce((m, x) => Math.max(m, parseInt(String(x.no).replace(/\D/g, '')) || 0), 0) + 1).padStart(4, '0');
 
 /* data from the previous (unencrypted) version, migrated once then deleted */
@@ -180,9 +190,9 @@ let legacy = null;
 async function showSetup() {
   legacy = await legacyRead(); me = null;
   $('.app').classList.add('locked');
-  $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Welcome to EPOS</h1><p>Create the administrator account.<br>Your data is encrypted with this password.</p>
+  $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Welcome to EPOS</h1><p>Create the administrator account.<br>This password locks the app on this device. Shop data is stored in your private shop database.</p>
     <div class="loginform">
-      ${legacy ? `<div class="stat" style="text-align:left"><b style="font-size:16px">Existing data found</b><span>${legacy.products.length} items, ${legacy.sales.length} sales will be encrypted and kept.</span></div>` : ''}
+      ${legacy ? `<div class="stat" style="text-align:left"><b style="font-size:16px">Existing data found</b><span>${legacy.products.length} items, ${legacy.sales.length} sales will be kept.</span></div>` : ''}
       <label class="fld">Store name<input id="sStore" value="${esc(legacy ? legacy.settings.store : '')}" placeholder="e.g. Corner Cafe" autocomplete="off"></label>
       <label class="fld">Your name<input id="sName" placeholder="e.g. Anna" autocomplete="off"></label>
       <label class="fld">Admin password (8+ characters)<input id="sPw" type="password" autocomplete="new-password"></label>
@@ -190,7 +200,7 @@ async function showSetup() {
       ${legacy ? '' : '<label class="group frow" style="border-radius:14px"><span>Add sample items</span><input id="sSample" type="checkbox" class="sw"></label>'}
       <div class="err" id="sErr"></div>
       <button class="btn pri big" data-act="createVault">Create & Start</button>
-      <div class="gf" style="text-align:center">If you forget this password the data cannot be recovered. Keep backups.</div>
+      <div class="gf" style="text-align:center">If you forget this admin password it cannot be reset from inside the app. Keep backups.</div>
       <button class="back" data-act="restore">Restore from backup file</button></div></div>`;
 }
 async function createVault() {
@@ -224,6 +234,7 @@ function renderLogin() {
     return;
   }
   if (u.needsReset) { m.innerHTML = `<div class="login">${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1><p>This PIN was not part of the cloud backup.<br>Ask an administrator to set a new PIN.</p><button class="back" data-act="pick" data-id="">‹ Switch account</button></div>`; return; }
+  if (!u.wrap) { m.innerHTML = `<div class="login">${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1><p>This sign-in is not available on this device.<br>${u.role === 'admin' ? 'Administrators sign in on a device connected with the admin shop account.' : 'Wait for sync to finish, then try again.'}</p><button class="back" data-act="pick" data-id="">‹ Switch account</button></div>`; return; }
   const wait = Math.ceil((u.until - Date.now()) / 1000), head = `${avatar(u, 'lg')}<h1 style="font-size:24px">${esc(u.name)}</h1>`;
   const msg = wait > 0 ? `Too many attempts. Try again in ${wait}s` : L.busy ? 'Unlocking…' : esc(L.err);
   if (u.role === 'admin') {
@@ -247,7 +258,7 @@ async function tryLogin(u, secret) {
     u.fails = (u.fails || 0) + 1;
     if (u.fails >= 5) u.until = Date.now() + Math.min(30000 * 2 ** (u.fails - 5), 900000);
     meta.fails = [{ ts: Date.now(), user: u.name }, ...(meta.fails || [])].slice(0, 30);
-    await saveMeta(); L.busy = false; L.pin = ''; L.err = u.role === 'admin' ? 'Incorrect password' : 'Incorrect PIN';
+    await saveMeta(true); L.busy = false; L.pin = ''; L.err = u.role === 'admin' ? 'Incorrect password' : 'Incorrect PIN';
     renderLogin(); const d = $('#dots'); if (d) d.classList.add('shake');
     if (u.until > Date.now()) { const t = setInterval(() => { if (!L.sel || u.until <= Date.now()) { clearInterval(t); } if (!me) renderLogin(); }, 1000); }
     return;
@@ -255,7 +266,7 @@ async function tryLogin(u, secret) {
   try {
     dek = await sub.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
     dekRaw = u.role === 'admin' ? raw : null;
-    u.fails = 0; u.until = 0; await saveMeta();
+    u.fails = 0; u.until = 0; await saveMeta(true);
     me = { id: u.id, name: u.name, role: u.role };
     await loadDb();
     if (lastUser !== me.id) { cart = []; custId = null; }
@@ -296,7 +307,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.18-15';
+const APP_VERSION = '2026.11.18-18';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
@@ -390,7 +401,7 @@ function sellView() {
       <div class="chips" id="chips"></div><div class="grid" id="grid"></div></div>
     <aside class="cart" id="cart"></aside><button class="cartbar" id="cartbar" data-act="cartOpen"></button></section>`;
 }
-const picHtml = p => p.img ? `<img src="${p.img}" alt="" loading="lazy">` : esc(p.icon || initial(p.name));
+const picHtml = p => safeImg(p.img) ? `<img src="${safeImg(p.img)}" alt="" loading="lazy">` : esc(p.icon || initial(p.name));
 function resizeImg(file, size = 400) { // square-crop + shrink so photos stay small (~30 KB)
   return new Promise((res, rej) => {
     const url = URL.createObjectURL(file), im = new Image();
@@ -518,8 +529,13 @@ function finishSale(print) {
   if (!isAdmin() && t.disc > maxDisc() + 0.001) return toast(`Discount over the cashier limit (${money(maxDisc())})`, true);
   const paid = method === 'cash' ? (ck.recv === '' ? t.total : +ck.recv) : t.total;
   if (paid < t.total) return toast('Cash received is less than total', true);
+  for (const ci of cart) { // stock may have changed on another device since the item was added
+    const p = prod(ci.id);
+    if (!p) return toast('An item in this order no longer exists. Remove it and try again.', true);
+    if (p.stock !== null && ci.qty > p.stock) return toast(`${p.name}: only ${Math.max(0, p.stock)} left in stock`, true);
+  }
   const sale = {
-    id: uid(), no: 'INV-' + String(++db.seq).padStart(5, '0'), ts: Date.now(), cashier: { id: me.id, name: me.name },
+    id: uid(), no: 'INV-' + String(++db.seq).padStart(5, '0') + '-' + devTag(), ts: Date.now(), cashier: { id: me.id, name: me.name },
     items: cart.map(c => { const p = prod(c.id); return { id: p.id, name: p.name, price: p.price, cost: p.cost || 0, qty: c.qty }; }),
     ...t, method, paid: r2(paid), change: r2(paid - t.total),
   };
@@ -575,7 +591,7 @@ function receiptLines(s) {
   return L;
 }
 function receiptHtml(lines) {
-  return `<div class="rcpt" style="width:${width() * 0.62 + 2}em">` + lines.map(l => l.img ? `<div class="c"><img src="${l.img}" alt="" style="max-width:55%;max-height:90px;filter:grayscale(1) contrast(1.4)"></div>` : `<div class="${l.a === 'c' ? 'c' : ''} ${l.b ? 'b' : ''} ${l.s === 2 ? 'd' : ''}">${esc(l.t) || ' '}</div>`).join('') + '</div>';
+  return `<div class="rcpt" style="width:${width() * 0.62 + 2}em">` + lines.map(l => l.img ? `<div class="c"><img src="${safeImg(l.img)}" alt="" style="max-width:55%;max-height:90px;filter:grayscale(1) contrast(1.4)"></div>` : `<div class="${l.a === 'c' ? 'c' : ''} ${l.b ? 'b' : ''} ${l.s === 2 ? 'd' : ''}">${esc(l.t) || ' '}</div>`).join('') + '</div>';
 }
 function showReceipt(s) {
   modal(`<h2>${s.void ? 'Voided sale' : 'Sale complete'}</h2>${receiptHtml(receiptLines(s))}
@@ -669,7 +685,7 @@ function poBody() {
     <div class="stat"><b>${db.pos.filter(p => p.status === 'draft').length}</b><span>Drafts</span></div>
     <div class="stat"><b>${money(db.pos.filter(p => p.status === 'received' && (p.receivedTs || 0) >= month).reduce((a, p) => a + p.total, 0))}</b><span>Received this month</span></div></div>
     <div class="chips" style="margin-bottom:14px">${[['all', 'All'], ['draft', 'Drafts'], ['ordered', 'Ordered'], ['received', 'Received'], ['cancelled', 'Cancelled']].map(([k, l]) => `<button class="chip ${poF === k ? 'on' : ''}" data-act="poFilter" data-f="${k}">${l}</button>`).join('')}</div>
-    <div class="group">${list.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="openPo" data-id="${p.id}"><span class="m"><b>${p.no} ${poBadge(p.status)}</b><small>${esc(p.supplierName || '—')} · ${fmtDate(p.ts)} · ${p.items.length} item${p.items.length === 1 ? '' : 's'}</small></span><span class="pr">${money(p.total ?? poTotal(p))}</span></button>`).join('')
+    <div class="group">${list.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="openPo" data-id="${p.id}"><span class="m"><b>${esc(p.no)} ${poBadge(p.status)}</b><small>${esc(p.supplierName || '—')} · ${fmtDate(p.ts)} · ${p.items.length} item${p.items.length === 1 ? '' : 's'}</small></span><span class="pr">${money(p.total ?? poTotal(p))}</span></button>`).join('')
     || '<div class="empty">No purchase orders yet.<br>Tap “New PO” to order stock from a supplier.</div>'}</div>`;
 }
 const suggestQty = p => Math.max((p.low || 0) * 2 - (p.stock || 0), 1);
@@ -707,7 +723,7 @@ function receiveHome() {
   const open = db.pos.filter(p => p.status === 'ordered' || p.status === 'partial');
   modal(`<h2>Receive goods</h2><div class="sub">Record a delivery from a supplier</div>
     <div class="gt" style="margin:0 8px">Against a purchase order</div>
-    <div class="group">${open.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="rcvPo" data-id="${p.id}"><span class="m"><b>${p.no} ${poBadge(p.status)}</b><small>${esc(p.supplierName)} · ${fmtDate(p.ts)}</small></span><span class="pr">${money(poOpenVal(p))}</span></button>`).join('')
+    <div class="group">${open.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="rcvPo" data-id="${p.id}"><span class="m"><b>${esc(p.no)} ${poBadge(p.status)}</b><small>${esc(p.supplierName)} · ${fmtDate(p.ts)}</small></span><span class="pr">${money(poOpenVal(p))}</span></button>`).join('')
     || '<div class="empty" style="padding:18px">No open purchase orders</div>'}</div>
     <button class="btn big" data-act="rcvDirect">Receive without a PO</button><button class="btn" data-act="close">Cancel</button>`);
 }
@@ -1072,7 +1088,7 @@ function dashView() {
       <div class="card"><h3>Top products</h3>${hbars(tops.map(t => ({ label: t.name, val: t.rev, text: money(t.rev), sub: t.qty + ' sold' })))}</div>
       <div class="card"><h3>Sales by category</h3>${hbars(cats.map(([c, v], i) => ({ label: c, val: v, text: money(v), color: PALETTE[i % PALETTE.length] })))}</div>
       <div class="card"><h3>Payment methods</h3>${pay.length ? `<div class="split">${pay.map(([m, v]) => `<i style="width:${v / payTot * 100}%;background:${PAYC[m] || '#8e8e93'}"></i>`).join('')}</div>
-        ${pay.map(([m, v]) => `<div class="leg"><span><u style="background:${PAYC[m] || '#8e8e93'}"></u>${PAYN[m] || m}</span><b>${money(v)} <small>${Math.round(v / payTot * 100)}%</small></b></div>`).join('')}` : '<div class="empty" style="padding:18px">No data yet</div>'}</div>
+        ${pay.map(([m, v]) => `<div class="leg"><span><u style="background:${PAYC[m] || '#8e8e93'}"></u>${PAYN[m] || esc(m)}</span><b>${money(v)} <small>${Math.round(v / payTot * 100)}%</small></b></div>`).join('')}` : '<div class="empty" style="padding:18px">No data yet</div>'}</div>
       <div class="card"><h3>Top customers</h3>${hbars(Object.entries(a.cust).sort((x, y) => y[1].v - x[1].v).slice(0, 6).map(([n, o]) => ({ label: n, val: o.v, text: money(o.v), sub: o.n + ' visit' + (o.n > 1 ? 's' : '') })), '#ff9500')}
         ${a.orders ? `<div class="gf" style="margin:10px 0 0">Members: ${Math.round(a.memberSales / (a.rev || 1) * 100)}% of sales${lyOn() ? ` · ${a.pts} points issued` : ''}</div>` : ''}</div>
       <div class="card"><h3>Staff performance</h3>${hbars(cash.map(([n, o]) => ({ label: n, val: o.v, text: money(o.v), sub: o.n + ' orders · avg ' + money(o.v / o.n) })), '#5856d6')}</div>
@@ -1149,7 +1165,7 @@ function settingsView() {
       + BTN('changeOwn', 'Change my password') + BTN('log', 'Activity log') + BTN('lock', 'Lock now'), '5 wrong attempts trigger a timed lockout. Anyone with the shop account can read the shop data, so keep it private.')}
     ${G('Shop sync', `<div class="frow" id="cloudStat" style="min-height:64px">${cloudStatHtml()}</div>` + BTN('syncNow', 'Sync now') + BTN('shopOut', 'Disconnect this device', 'dng'),
       'Every device signed in to the same shop account shares this data live. Changes made offline are sent as soon as the connection returns. To add a device: open the app on it and sign in with the shop account.')}
-    ${G('Data', BTN('export', 'Export encrypted backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} CSV files are NOT encrypted — keep them private.`)}${aboutGroup()}</div>`;
+    ${G('Data', BTN('export', 'Export backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} Backup and CSV files are NOT encrypted — keep them private.`)}${aboutGroup()}</div>`;
 }
 
 /* ---------- team + security sheets (admin) ---------- */
@@ -1175,7 +1191,7 @@ async function saveUser(id) {
   if (!u && meta.users.some(x => x.name.toLowerCase() === name.toLowerCase())) return toast('That name already exists', true);
   toast('Saving…');
   const nu = await makeUser(name, role, sec, dekRaw);
-  if (u) { Object.assign(u, { salt: nu.salt, wrap: nu.wrap, fails: 0, until: 0 }); delete u.needsReset; logEv('user', `Reset credentials for ${u.name}`); }
+  if (u) { Object.assign(u, { salt: nu.salt, wrap: nu.wrap, credUpd: Date.now(), fails: 0, until: 0 }); delete u.needsReset; logEv('user', `Reset credentials for ${u.name}`); }
   else { meta.users.push(nu); logEv('user', `Added ${role} ${name}`); }
   await saveMeta(); UF = { role: 'cashier' }; closeModal(); render(); toast('Saved');
 }
@@ -1184,7 +1200,7 @@ function removeUser(id) {
   if (!u || u.id === me.id) return;
   if (u.role === 'admin' && meta.users.filter(x => x.role === 'admin').length < 2) return toast('Keep at least one administrator', true);
   if (!confirm(`Remove ${u.name}? Their past sales stay in the history.`)) return;
-  meta.users = meta.users.filter(x => x.id !== id); saveMeta(); logEv('user', `Removed ${u.name}`); closeModal(); render();
+  meta.users = meta.users.filter(x => x.id !== id); markDirty('creds/' + id); saveMeta(); logEv('user', `Removed ${u.name}`); closeModal(); render();
 }
 function ownSecretSheet() {
   const pin = !isAdmin();
@@ -1199,7 +1215,7 @@ async function saveOwn() {
   const bad = validSecret(me.role, nw); if (bad) return toast(bad, true);
   if (nw !== $('#oNew2').value) return toast('Entries do not match', true);
   toast('Checking…'); const raw = await tryUnwrap(u, cur); if (!raw) return toast('Current ' + (pin() ? 'PIN' : 'password') + ' is wrong', true);
-  const nu = await makeUser(u.name, u.role, nw, raw); u.salt = nu.salt; u.wrap = nu.wrap; await saveMeta();
+  const nu = await makeUser(u.name, u.role, nw, raw); u.salt = nu.salt; u.wrap = nu.wrap; u.credUpd = Date.now(); await saveMeta();
   logEv('user', 'Changed own credentials'); closeModal(); toast('Updated');
   function pin() { return me.role !== 'admin'; }
 }
@@ -1215,7 +1231,7 @@ function askSecret(title, text, cb) {
   askSecret.cb = cb; setTimeout(() => { const i = $('#aPw'); i && i.focus(); }, 60);
 }
 
-/* ---------- backup / restore (stays encrypted) ---------- */
+/* ---------- backup / restore ---------- */
 const toB = u => { let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
 const fromB = b => Uint8Array.from(atob(b), c => c.charCodeAt(0));
 async function exportBackup() {
@@ -1224,7 +1240,7 @@ async function exportBackup() {
   const json = JSON.stringify(dump, (k, v) => v instanceof Uint8Array ? { $b: toB(v) } : v);
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
   a.download = `epos-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click();
-  meta.lastBackup = Date.now(); saveMeta(); logEv('backup', 'Exported encrypted backup'); render();
+  meta.lastBackup = Date.now(); saveMeta(); logEv('backup', 'Exported backup'); render();
 }
 let restoreMode = false;
 async function importBackup(file) {
@@ -1236,7 +1252,7 @@ async function importBackup(file) {
       t.objectStore('kv').put(d.meta, 'users'); t.objectStore('vault').put(d.vault, 'main');
       DOCS.forEach(n => { const o = t.objectStore(n); o.clear(); (d[n] || []).forEach(x => o.put(x)); });
     });
-    meta = d.meta; cart = []; lastUser = null; markAllDirty(); toast('Backup restored — please sign in'); showLogin();
+    meta = d.meta; meta.upd = Date.now(); meta.users.forEach(u => { u.credUpd = Date.now(); }); await IDB.put('kv', meta, 'users'); cart = []; lastUser = null; markAllDirty(); toast('Backup restored — please sign in'); showLogin();
   } catch (e) { toast('Not a valid EPOS backup file', true); }
 }
 
@@ -1259,21 +1275,34 @@ const timeAgo = ts => { const m = Math.round((Date.now() - ts) / 60000); return 
 function saveSync() { clearTimeout(syncSaveT); syncSaveT = setTimeout(() => { if (syncSt) IDB.put('kv', syncSt, 'sync').catch(() => {}); }, 800); }
 function markDirty(key) { if (!syncSt) return; if (!syncSt.dirty.includes(key)) syncSt.dirty.push(key); saveSync(); scheduleSync(); }
 async function markAllDirty() {
-  if (!syncSt) return; const have = new Set(syncSt.dirty); have.add('meta'); have.add('vault');
+  if (!syncSt) return; const have = new Set(syncSt.dirty); have.add('meta'); have.add('vault'); ((meta && meta.users) || []).forEach(u => have.add('creds/' + u.id));
   for (const s of DOCS) (await IDB.all(s)).forEach(r => have.add(s + '/' + r.id));
   syncSt.dirty = [...have]; saveSync(); scheduleSync();
 }
 function scheduleSync() { clearTimeout(syncT); syncT = setTimeout(() => syncFlush(), 1200); }
+// Opened from a password-reset email? The link carries #access_token=…&type=recovery (or #error=… when expired). Read it before the client strips it.
+const AUTH_URL = (() => { const h = location.hash + '&' + location.search.slice(1); const g = k => { const m = h.match(new RegExp('[#&?]' + k + '=([^&]*)')); return m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : ''; }; return { recovery: g('type') === 'recovery', err: g('error_description') || g('error') }; })();
 function sbClient() {
   if (sb) return sb; if (!window.supabase) return null;
   sb = supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true, storageKey: 'epos.auth' } });
+  sb.auth.onAuthStateChange(ev => { if (ev === 'PASSWORD_RECOVERY') setTimeout(showNewPassword, 0); });
   return sb;
 }
 async function shopSession() { try { const c = sbClient(); if (!c) return null; const { data } = await c.auth.getSession(); return data && data.session; } catch (e) { return null; } }
 
 /* ---------- local row <-> shared row ---------- */
 async function toRemote(key) {
-  if (key === 'meta') return meta ? { store: 'meta', id: 'main', data: jclean({ ...meta, fails: [] }), upd: meta.upd || 1, del: false } : null;
+  if (key === 'meta') { // shared copy never contains password/PIN verifiers
+    if (!meta) return null;
+    const users = meta.users.map(u => ({ id: u.id, name: u.name, role: u.role, avatar: u.avatar, created: u.created }));
+    return { store: 'meta', id: 'main', data: jclean({ ...meta, users, fails: [] }), upd: meta.upd || 1, del: false };
+  }
+  if (key.startsWith('creds/')) { // one row per user, so the server can hide administrator rows from cashier accounts
+    if (!meta) return null; const id = key.slice(6), u = meta.users.find(x => x.id === id);
+    if (!u) return { store: 'creds', id, data: null, upd: Date.now(), del: true };
+    if (!u.wrap) return null;
+    return { store: 'creds', id, data: jclean({ role: u.role, salt: u.salt, wrap: u.wrap }), upd: u.credUpd || 1, del: false };
+  }
   if (key === 'vault') { const v = await IDB.get('vault', 'main'); return v ? { store: 'vault', id: 'main', data: await decObj(v.d), upd: v.upd || 1, del: false } : null; }
   const i = key.indexOf('/'), store = key.slice(0, i), r = await IDB.get(store, key.slice(i + 1));
   return r ? { store, id: r.id, data: r.del ? null : await decObj(r.d), upd: r.upd || 0, del: !!r.del } : null;
@@ -1305,19 +1334,31 @@ async function mergeVault(data, upd) { // settings: newest wins, except this dev
   if (newer) { const s = { ...DEF, ...data.settings }; ['method', 'btId', 'btName', 'paper'].forEach(k => { if (db.settings[k] !== undefined) s[k] = db.settings[k]; }); db.settings = s; }
   db.seq = seq; await IDB.put('vault', { d: { settings: db.settings, seq }, upd: newer ? upd : (mine.upd || 0) }, 'main'); return 1;
 }
-async function mergeMeta(data, upd) { // people, logo, store name: newest wins; auto-lock stays per device
+/* Password / PIN verifiers (salt + wrap) travel as separate 'creds' rows. credStore keeps what arrived, even before the user list does. */
+let credStore = {};
+async function attachCreds() {
+  let ch = 0; if (!meta) return 0;
+  for (const u of meta.users) { const c = credStore[u.id]; if (c && c.wrap && (!u.wrap || c.upd > (u.credUpd || 0))) { u.salt = c.salt; u.wrap = c.wrap; u.credUpd = c.upd; delete u.needsReset; ch++; } }
+  try { await IDB.put('kv', credStore, 'creds'); if (ch) await IDB.put('kv', meta, 'users'); } catch (e) {}
+  return ch;
+}
+async function mergeMeta(data, upd) { // people, logo, store name: newest wins; auto-lock and login counters stay per device
   if (!data || (meta && (meta.upd || 0) >= upd)) return 0;
   const keep = meta ? { autoLock: meta.autoLock, lastBackup: meta.lastBackup, fails: meta.fails } : {};
-  meta = { ...data, ...keep, upd }; await IDB.put('kv', meta, 'users'); return 1;
+  const old = new Map(((meta && meta.users) || []).map(u => [u.id, u]));
+  const users = (data.users || []).map(ru => { const o = old.get(ru.id) || {}; return { ...ru, salt: o.salt || ru.salt, wrap: o.wrap || ru.wrap, credUpd: o.credUpd || 0, fails: o.fails || 0, until: o.until || 0 }; });
+  meta = { ...data, ...keep, users, upd }; await attachCreds(); await IDB.put('kv', meta, 'users'); return 1;
 }
 async function applyRemote(list) {
-  let n = 0; const by = {};
+  let n = 0, credGot = false; const by = {};
   for (const r of list) {
-    if (r.store === 'meta') n += await mergeMeta(r.data && jrestore(r.data), r.upd);
+    if (r.store === 'creds') { credGot = true; if (r.del || !r.data) delete credStore[r.id]; else { const d = jrestore(r.data); if (!credStore[r.id] || r.upd >= credStore[r.id].upd) credStore[r.id] = { salt: d.salt, wrap: d.wrap, role: d.role, upd: r.upd }; } }
+    else if (r.store === 'meta') n += await mergeMeta(r.data && jrestore(r.data), r.upd);
     else if (r.store === 'vault') n += await mergeVault(r.data && jrestore(r.data), r.upd);
     else if (DOCS.includes(r.store)) (by[r.store] = by[r.store] || []).push(fromRemote(r));
   }
   for (const s in by) n += await mergeRows(s, by[s]);
+  if (credGot) { n += await attachCreds(); }
   if (n && db) { recomputeStock(); queueRender(); }
   return n;
 }
@@ -1375,6 +1416,9 @@ function sbSubscribe() {
 }
 async function sbStart() { // called after someone signs in to the app
   if (!sbClient() || !syncSt || !(await shopSession())) return;
+  if (isAdmin() && !syncSt.credsSplit) { // one time: move verifiers out of the shared 'meta' row into 'creds' rows and overwrite the old shared copy
+    syncSt.credsSplit = true; meta.users.forEach(u => { u.credUpd = u.credUpd || 1; }); await saveMeta();
+  }
   if (!syncSt.seeded) { syncSt.seeded = true; if (!syncSt.srv) await markAllDirty(); } // first device on an empty shop database uploads what it has; a device that just downloaded the shop data does not
   sbSubscribe(); syncFlush({ pull: true });
 }
@@ -1397,6 +1441,25 @@ async function shopIn() {
   err.textContent = 'Loading shop data…';
   try { const n = await syncPull(); if (n > 0) syncSt.seeded = true; } catch (e) { err.textContent = 'Could not load data: ' + e.message; return; }
   sbSubscribe(); meta && meta.users && meta.users.length ? showLogin() : showSetup();
+}
+/* ---------- set a new shop password (arrives from the reset email) ---------- */
+function showNewPassword(msg) {
+  $('.app').classList.add('locked'); me = null; db = null; dek = null;
+  $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Set a new shop password</h1><p>Choose the password for the shop account.<br>Use it to connect each device.</p>
+    <div class="loginform"><label class="fld">New password (8+ characters)<input id="npPw" type="password" autocomplete="new-password"></label>
+      <label class="fld">Confirm password<input id="npPw2" type="password" autocomplete="new-password"></label>
+      <div class="err" id="npErr">${esc(msg || '')}</div><button class="btn pri big" data-act="setShopPw">Save password</button></div></div>`;
+}
+async function setShopPw() {
+  const pw = $('#npPw').value, err = $('#npErr');
+  if (pw.length < 8) { err.textContent = 'Password must be at least 8 characters'; return; }
+  if (pw !== $('#npPw2').value) { err.textContent = 'Passwords do not match'; return; }
+  if (!(await shopSession())) { showShopLogin('This reset link has expired. Request a new one.'); return; }
+  err.textContent = 'Saving…';
+  const { error } = await sb.auth.updateUser({ password: pw });
+  if (error) { err.textContent = error.message; return; }
+  try { history.replaceState(null, '', location.pathname); } catch (e) {}
+  location.replace(location.pathname); // reload: the device is already signed in, continue normally
 }
 async function shopOut() {
   if (!confirm('Disconnect this device from the shop? Unsent changes are sent first. You must sign in to the shop again to use the app.')) return;
@@ -1463,7 +1526,7 @@ const A = {
   lock: () => lock(),
   checkUpdate: () => checkUpdate(false), applyUpdate: () => applyUpdate(),
   /* shop sync */
-  shopIn: () => shopIn(),
+  shopIn: () => shopIn(), setShopPw: () => setShopPw(),
   syncNow: () => { toast('Syncing…'); syncFlush({ manual: true, pull: true }).then(ok => { if (ok) toast('Everything is up to date ✓'); }); },
   shopOut: () => shopOut(),
   /* camera scanner */
@@ -1635,8 +1698,13 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) close
 /* ---------- boot ---------- */
 (async function boot() {
   if (!window.crypto || !crypto.subtle) { $('#main').innerHTML = '<div class="empty">A secure (HTTPS) connection is required.<br>Open the app from its https:// address.</div>'; return; }
-  try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), dirty: [], last: 0, err: '', srv: '', seeded: false }; syncSt.err = ''; syncSt.dirty = syncSt.dirty || []; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
+  try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), dirty: [], last: 0, err: '', srv: '', seeded: false }; syncSt.err = ''; syncSt.dirty = syncSt.dirty || []; credStore = (await IDB.get('kv', 'creds')) || {}; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
   sbClient(); const has = () => meta && meta.users && meta.users.length;
+  if (AUTH_URL.recovery) { // reset-email link: let the user choose a new password first
+    if (await shopSession()) return showNewPassword();
+    return showShopLogin('This reset link is invalid or has expired. Request a new one in Supabase.');
+  }
+  if (AUTH_URL.err) { try { history.replaceState(null, '', location.pathname); } catch (e) {} return showShopLogin(AUTH_URL.err); }
   let signed = !!(await shopSession());
   if (!signed && has() && !navigator.onLine) signed = true;            // offline start of a device that already holds the data
   if (!signed && !has() && localStorage.getItem('epos.shop') && !navigator.onLine) { $('#main').innerHTML = '<div class="empty">No internet.<br>Connect once to load the shop data.</div>'; return; }
