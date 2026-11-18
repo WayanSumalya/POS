@@ -136,7 +136,7 @@ async function fullSave() {
   markAllDirty();
 }
 async function loadDb() {
-  const vault = await decObj((await IDB.get('vault', 'main')).d);
+  const vr = await IDB.get('vault', 'main'), vault = (vr && vr.d && await decObj(vr.d)) || {}; // no settings row yet (new device, nothing synced): use defaults
   const dec = async s => Promise.all((await IDB.all(s)).filter(r => !r.del).map(r => decObj(r.d)));
   const [products, sales, log, suppliers, pos, counts, customers, grn, moves] = await Promise.all(DOCS.map(dec));
   const byTs = (a, b) => (b.ts || 0) - (a.ts || 0);
@@ -271,7 +271,7 @@ async function tryLogin(u, secret) {
     await loadDb();
     if (lastUser !== me.id) { cart = []; custId = null; }
     lastUser = me.id; logEv('login', 'Signed in'); enterApp();
-  } catch (e) { dek = null; me = null; L.busy = false; L.err = 'Could not open data'; renderLogin(); }
+  } catch (e) { console.error('open data failed', e); dek = null; me = null; L.busy = false; L.err = 'Could not open data (' + ((e && (e.message || e.name)) || 'unknown') + ')'; renderLogin(); }
 }
 function lock() { cart = cart.slice(); showLogin(); }
 function enterApp() {
@@ -307,7 +307,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.18-19';
+const APP_VERSION = '2026.11.18-20';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];

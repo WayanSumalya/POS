@@ -1,4 +1,4 @@
-const C = 'epos-v19';
+const C = 'epos-v20';
 const FILES = ['./', 'index.html', 'app.js', 'supabase.js', 'style.css', 'manifest.webmanifest', 'icon.svg'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(C).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', e => {
