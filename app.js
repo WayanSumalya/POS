@@ -307,7 +307,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.18-20';
+const APP_VERSION = '2026.11.18-21';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
@@ -1416,8 +1416,8 @@ function sbSubscribe() {
 }
 async function sbStart() { // called after someone signs in to the app
   if (!sbClient() || !syncSt || !(await shopSession())) return;
-  if (isAdmin() && !syncSt.credsSplit) { // one time: move verifiers out of the shared 'meta' row into 'creds' rows and overwrite the old shared copy
-    syncSt.credsSplit = true; meta.users.forEach(u => { u.credUpd = u.credUpd || 1; }); await saveMeta();
+  if (isAdmin() && !syncSt.credsSplit2) { // one time: move verifiers out of the shared 'meta' row into 'creds' rows and overwrite the old shared copy
+    syncSt.credsSplit = syncSt.credsSplit2 = true; meta.users.forEach(u => { u.credUpd = u.credUpd || 1; markDirty('creds/' + u.id); }); await saveMeta(); // credsSplit2: re-send the login rows once more (the first attempt never reached the server)
   }
   if (!syncSt.seeded) { syncSt.seeded = true; if (!syncSt.srv) await markAllDirty(); } // first device on an empty shop database uploads what it has; a device that just downloaded the shop data does not
   sbSubscribe(); syncFlush({ pull: true });
