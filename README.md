@@ -35,6 +35,8 @@ All devices share one database. Sell on the cashier tablet and see it on your ph
 3. Authentication → Users → Add user (the *shop account*: an email + password, tick Auto Confirm). Authentication → Sign In / Providers → turn **off** “Allow new users to sign up”.
 4. The project URL and the public (publishable) key are set at the top of the sync section in `app.js` (`SB_URL`, `SB_KEY`).
 
+**Forgot the shop password:** Supabase → Authentication → Users → ⋯ → Send password recovery. Set Authentication → URL Configuration → Site URL to the app's address (e.g. `https://<you>.github.io/POS/`). The email link opens the app on a "Set a new shop password" screen.
+
 **Add a device:** open the app → sign in with the shop account → sign in with your EPOS user (admin password / cashier PIN). That is all.
 
 How it works: every record is a row (newest change wins); stock is stored as +/- movements, so two devices selling and receiving at the same time add up instead of overwriting each other. Settings → Shop sync shows the status (Live / Offline / pending).

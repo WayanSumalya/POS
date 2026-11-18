@@ -307,7 +307,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.18-17';
+const APP_VERSION = '2026.11.18-18';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
@@ -1280,9 +1280,12 @@ async function markAllDirty() {
   syncSt.dirty = [...have]; saveSync(); scheduleSync();
 }
 function scheduleSync() { clearTimeout(syncT); syncT = setTimeout(() => syncFlush(), 1200); }
+// Opened from a password-reset email? The link carries #access_token=…&type=recovery (or #error=… when expired). Read it before the client strips it.
+const AUTH_URL = (() => { const h = location.hash + '&' + location.search.slice(1); const g = k => { const m = h.match(new RegExp('[#&?]' + k + '=([^&]*)')); return m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : ''; }; return { recovery: g('type') === 'recovery', err: g('error_description') || g('error') }; })();
 function sbClient() {
   if (sb) return sb; if (!window.supabase) return null;
   sb = supabase.createClient(SB_URL, SB_KEY, { auth: { persistSession: true, autoRefreshToken: true, storageKey: 'epos.auth' } });
+  sb.auth.onAuthStateChange(ev => { if (ev === 'PASSWORD_RECOVERY') setTimeout(showNewPassword, 0); });
   return sb;
 }
 async function shopSession() { try { const c = sbClient(); if (!c) return null; const { data } = await c.auth.getSession(); return data && data.session; } catch (e) { return null; } }
@@ -1439,6 +1442,25 @@ async function shopIn() {
   try { const n = await syncPull(); if (n > 0) syncSt.seeded = true; } catch (e) { err.textContent = 'Could not load data: ' + e.message; return; }
   sbSubscribe(); meta && meta.users && meta.users.length ? showLogin() : showSetup();
 }
+/* ---------- set a new shop password (arrives from the reset email) ---------- */
+function showNewPassword(msg) {
+  $('.app').classList.add('locked'); me = null; db = null; dek = null;
+  $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Set a new shop password</h1><p>Choose the password for the shop account.<br>Use it to connect each device.</p>
+    <div class="loginform"><label class="fld">New password (8+ characters)<input id="npPw" type="password" autocomplete="new-password"></label>
+      <label class="fld">Confirm password<input id="npPw2" type="password" autocomplete="new-password"></label>
+      <div class="err" id="npErr">${esc(msg || '')}</div><button class="btn pri big" data-act="setShopPw">Save password</button></div></div>`;
+}
+async function setShopPw() {
+  const pw = $('#npPw').value, err = $('#npErr');
+  if (pw.length < 8) { err.textContent = 'Password must be at least 8 characters'; return; }
+  if (pw !== $('#npPw2').value) { err.textContent = 'Passwords do not match'; return; }
+  if (!(await shopSession())) { showShopLogin('This reset link has expired. Request a new one.'); return; }
+  err.textContent = 'Saving…';
+  const { error } = await sb.auth.updateUser({ password: pw });
+  if (error) { err.textContent = error.message; return; }
+  try { history.replaceState(null, '', location.pathname); } catch (e) {}
+  location.replace(location.pathname); // reload: the device is already signed in, continue normally
+}
 async function shopOut() {
   if (!confirm('Disconnect this device from the shop? Unsent changes are sent first. You must sign in to the shop again to use the app.')) return;
   try { await syncFlush({ manual: true }); } catch (e) {}
@@ -1504,7 +1526,7 @@ const A = {
   lock: () => lock(),
   checkUpdate: () => checkUpdate(false), applyUpdate: () => applyUpdate(),
   /* shop sync */
-  shopIn: () => shopIn(),
+  shopIn: () => shopIn(), setShopPw: () => setShopPw(),
   syncNow: () => { toast('Syncing…'); syncFlush({ manual: true, pull: true }).then(ok => { if (ok) toast('Everything is up to date ✓'); }); },
   shopOut: () => shopOut(),
   /* camera scanner */
@@ -1678,6 +1700,11 @@ document.addEventListener('visibilitychange', () => { if (document.hidden) close
   if (!window.crypto || !crypto.subtle) { $('#main').innerHTML = '<div class="empty">A secure (HTTPS) connection is required.<br>Open the app from its https:// address.</div>'; return; }
   try { await IDB.open(); meta = await IDB.get('kv', 'users'); syncSt = (await IDB.get('kv', 'sync')) || { deviceId: uid(), dirty: [], last: 0, err: '', srv: '', seeded: false }; syncSt.err = ''; syncSt.dirty = syncSt.dirty || []; credStore = (await IDB.get('kv', 'creds')) || {}; } catch (e) { $('#main').innerHTML = '<div class="empty">Storage is unavailable.<br>Turn off private/incognito mode.</div>'; return; }
   sbClient(); const has = () => meta && meta.users && meta.users.length;
+  if (AUTH_URL.recovery) { // reset-email link: let the user choose a new password first
+    if (await shopSession()) return showNewPassword();
+    return showShopLogin('This reset link is invalid or has expired. Request a new one in Supabase.');
+  }
+  if (AUTH_URL.err) { try { history.replaceState(null, '', location.pathname); } catch (e) {} return showShopLogin(AUTH_URL.err); }
   let signed = !!(await shopSession());
   if (!signed && has() && !navigator.onLine) signed = true;            // offline start of a device that already holds the data
   if (!signed && !has() && localStorage.getItem('epos.shop') && !navigator.onLine) { $('#main').innerHTML = '<div class="empty">No internet.<br>Connect once to load the shop data.</div>'; return; }
