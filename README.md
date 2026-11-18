@@ -1,7 +1,7 @@
 # EPOS – POS + inventory (PWA, offline-capable, live multi-device)
 
 Files: `index.html`, `style.css`, `app.js`, `sw.js`, `manifest.webmanifest`, `icon.svg`.
-Host over HTTPS (GitHub Pages is free) – required for encryption APIs, Bluetooth and installing.
+Host over HTTPS (GitHub Pages is free) – required for the crypto API (password hashing), Bluetooth and installing.
 
 ## Roles
 | | Administrator | Cashier |
@@ -46,7 +46,7 @@ Moving to another host later (e.g. your own server) only means re-implementing t
 Tap the scan icon in the Sell search bar (scan many items in a row), in an item's SKU field, in the Inventory search, in a stock count (each scan adds 1 to the count), or when adding lines to a purchase order / delivery. Uses Chrome's built-in BarcodeDetector (EAN/UPC, Code 128/39, QR…) – no external code. Needs camera permission and HTTPS. Bluetooth/USB scanners also work by typing into the search box. Set each item's SKU to its barcode.
 
 ## Security
-- Sign-in: admin password (PBKDF2, 310k rounds) / cashier PIN; 5 wrong attempts → timed lockout. Data is shared through your private Supabase project (shop-account login + row-level security); it is no longer encrypted on the device.
+- Sign-in: admin password (PBKDF2, 310k rounds) / cashier PIN; 5 wrong attempts → timed lockout. Data is shared through your private Supabase project (shop-account login + row-level security); shop data is stored as plain JSON on the device and in Supabase (not encrypted). Backup and CSV files are not encrypted either. Roles are enforced in the app, not by the server: anyone holding the shop account can reach all data through the Supabase API.
 - 5 wrong attempts → timed lockout (30 s, doubling). Failed sign-ins are recorded.
 - Auto-lock when idle (default 5 min). Activity log of logins, voids, price/stock changes, discounts, user changes.
 - Backup files exported from Settings still work; CSV export is plain text – admin only, password re-check.

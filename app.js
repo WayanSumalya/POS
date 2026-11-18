@@ -1,10 +1,12 @@
 'use strict';
 /* ====================================================================
-   EPOS v2 — POS + inventory, roles (admin / cashier), encrypted storage
-   Security model (no server needed):
-   - A random 256-bit data key (DEK) encrypts every record with AES-GCM.
-   - Each user's password / PIN is stretched with PBKDF2 (310k rounds) into a key
-     that wraps the DEK. Without a valid login the stored data is unreadable.
+   EPOS v2 — POS + inventory, roles (admin / cashier), shared shop database
+   Security model:
+   - Records are stored as plain JSON on the device and in the shop's Supabase project.
+     They are NOT encrypted: protection is the shop account login + row-level security,
+     plus the device's own screen lock.
+   - Each user's password / PIN is stretched with PBKDF2 (310k rounds) and only gates the app screen.
+     Roles (admin / cashier) are enforced inside the app, not by the server.
    - 5 wrong attempts → progressive lockout. Auto-lock when idle. Activity log.
    ==================================================================== */
 const $ = s => document.querySelector(s);
@@ -18,10 +20,12 @@ const hue = s => { let h = 0; for (const c of String(s || '?')) h = (h * 31 + c.
 const initial = s => (String(s || '?').trim()[0] || '?').toUpperCase();
 const uById = id => (meta && meta.users.find(u => u.id === id)) || null;
 // avatar: user photo, otherwise a person icon (not initials)
-const avatar = (u, cls = '') => `<span class="av ${cls}${u && u.avatar ? ' ph' : ''}">${u && u.avatar ? `<img src="${u.avatar}" alt="">` : ICONS_PERSON}</span>`;
+// images arrive from the shared database: only accept real base64 image data (blocks attribute injection)
+const safeImg = v => typeof v === 'string' && /^data:image\/(png|jpe?g|gif|webp);base64,[A-Za-z0-9+\/=]+$/.test(v) ? v : '';
+const avatar = (u, cls = '') => `<span class="av ${cls}${safeImg(u && u.avatar) ? ' ph' : ''}">${safeImg(u && u.avatar) ? `<img src="${safeImg(u.avatar)}" alt="">` : ICONS_PERSON}</span>`;
 const ICONS_PERSON = '<svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>';
 // shop logo (stored unencrypted in meta so the lock screen can show it)
-const brandMark = (cls = '') => `<span class="logo ${cls}">${meta && meta.logo ? `<img src="${meta.logo}" alt="">` : ICON.logo}</span>`;
+const brandMark = (cls = '') => `<span class="logo ${cls}">${meta && safeImg(meta.logo) ? `<img src="${safeImg(meta.logo)}" alt="">` : ICON.logo}</span>`;
 
 /* ---------- state ---------- */
 let db = null;          // decrypted working data (only while unlocked)
@@ -65,7 +69,7 @@ const startOfDay = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), d
 const stockBadge = p => p.stock === null ? '' : p.stock <= 0 ? '<span class="badge out">Out</span>' : p.stock <= p.low ? `<span class="badge low">${p.stock} left</span>` : `<span class="badge">${p.stock}</span>`;
 
 /* ====================================================================
-   STORAGE (IndexedDB) + ENCRYPTION
+   STORAGE (IndexedDB) + PASSWORD LOGIN
    ==================================================================== */
 const DOCS = ['products', 'sales', 'log', 'suppliers', 'pos', 'counts', 'customers', 'grn', 'moves']; // 'moves' = stock changes (+/- amounts) so several devices can add up instead of overwriting each other
 const devId = () => ((typeof syncSt !== 'undefined' && syncSt && syncSt.deviceId) || 'x').slice(0, 6);
@@ -148,6 +152,8 @@ function setStock(p, n) { // every stock change is recorded as +/- amount
   const d = n - (p.stock || 0); p.stock = n; if (!d) return;
   const m = { id: uid(), ts: Date.now(), pid: p.id, d, dev: devId() }; (db.moves = db.moves || []).push(m); persist('moves', m);
 }
+// short random per-device tag so two devices selling offline can never issue the same invoice number
+const devTag = () => String((syncSt && syncSt.deviceId) || 'x').slice(-3).toUpperCase().padStart(3, '0');
 const nextNo = (prefix, arr) => prefix + String(arr.reduce((m, x) => Math.max(m, parseInt(String(x.no).replace(/\D/g, '')) || 0), 0) + 1).padStart(4, '0');
 
 /* data from the previous (unencrypted) version, migrated once then deleted */
@@ -180,9 +186,9 @@ let legacy = null;
 async function showSetup() {
   legacy = await legacyRead(); me = null;
   $('.app').classList.add('locked');
-  $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Welcome to EPOS</h1><p>Create the administrator account.<br>Your data is encrypted with this password.</p>
+  $('#main').innerHTML = `<div class="login"><div class="logo">${ICON.logo}</div><h1>Welcome to EPOS</h1><p>Create the administrator account.<br>This password locks the app on this device. Shop data is stored in your private shop database.</p>
     <div class="loginform">
-      ${legacy ? `<div class="stat" style="text-align:left"><b style="font-size:16px">Existing data found</b><span>${legacy.products.length} items, ${legacy.sales.length} sales will be encrypted and kept.</span></div>` : ''}
+      ${legacy ? `<div class="stat" style="text-align:left"><b style="font-size:16px">Existing data found</b><span>${legacy.products.length} items, ${legacy.sales.length} sales will be kept.</span></div>` : ''}
       <label class="fld">Store name<input id="sStore" value="${esc(legacy ? legacy.settings.store : '')}" placeholder="e.g. Corner Cafe" autocomplete="off"></label>
       <label class="fld">Your name<input id="sName" placeholder="e.g. Anna" autocomplete="off"></label>
       <label class="fld">Admin password (8+ characters)<input id="sPw" type="password" autocomplete="new-password"></label>
@@ -190,7 +196,7 @@ async function showSetup() {
       ${legacy ? '' : '<label class="group frow" style="border-radius:14px"><span>Add sample items</span><input id="sSample" type="checkbox" class="sw"></label>'}
       <div class="err" id="sErr"></div>
       <button class="btn pri big" data-act="createVault">Create & Start</button>
-      <div class="gf" style="text-align:center">If you forget this password the data cannot be recovered. Keep backups.</div>
+      <div class="gf" style="text-align:center">If you forget this admin password it cannot be reset from inside the app. Keep backups.</div>
       <button class="back" data-act="restore">Restore from backup file</button></div></div>`;
 }
 async function createVault() {
@@ -296,7 +302,7 @@ function render() {
 }
 
 /* ---------- app version + update check ---------- */
-const APP_VERSION = '2026.11.18-15';
+const APP_VERSION = '2026.11.18-16';
 const aboutGroup = () => G('About', `<div class="frow"><span>Version</span><span style="margin-left:auto;color:var(--l2)" id="verTxt">${APP_VERSION}</span></div>` + BTN('checkUpdate', 'Check for updates'));
 async function latestVersion() {
   const t = await (await fetch('app.js?v=' + Date.now(), { cache: 'no-store' })).text(), v = (t.match(/APP_VERSION = '([^']+)'/) || [])[1];
@@ -390,7 +396,7 @@ function sellView() {
       <div class="chips" id="chips"></div><div class="grid" id="grid"></div></div>
     <aside class="cart" id="cart"></aside><button class="cartbar" id="cartbar" data-act="cartOpen"></button></section>`;
 }
-const picHtml = p => p.img ? `<img src="${p.img}" alt="" loading="lazy">` : esc(p.icon || initial(p.name));
+const picHtml = p => safeImg(p.img) ? `<img src="${safeImg(p.img)}" alt="" loading="lazy">` : esc(p.icon || initial(p.name));
 function resizeImg(file, size = 400) { // square-crop + shrink so photos stay small (~30 KB)
   return new Promise((res, rej) => {
     const url = URL.createObjectURL(file), im = new Image();
@@ -518,8 +524,13 @@ function finishSale(print) {
   if (!isAdmin() && t.disc > maxDisc() + 0.001) return toast(`Discount over the cashier limit (${money(maxDisc())})`, true);
   const paid = method === 'cash' ? (ck.recv === '' ? t.total : +ck.recv) : t.total;
   if (paid < t.total) return toast('Cash received is less than total', true);
+  for (const ci of cart) { // stock may have changed on another device since the item was added
+    const p = prod(ci.id);
+    if (!p) return toast('An item in this order no longer exists. Remove it and try again.', true);
+    if (p.stock !== null && ci.qty > p.stock) return toast(`${p.name}: only ${Math.max(0, p.stock)} left in stock`, true);
+  }
   const sale = {
-    id: uid(), no: 'INV-' + String(++db.seq).padStart(5, '0'), ts: Date.now(), cashier: { id: me.id, name: me.name },
+    id: uid(), no: 'INV-' + String(++db.seq).padStart(5, '0') + '-' + devTag(), ts: Date.now(), cashier: { id: me.id, name: me.name },
     items: cart.map(c => { const p = prod(c.id); return { id: p.id, name: p.name, price: p.price, cost: p.cost || 0, qty: c.qty }; }),
     ...t, method, paid: r2(paid), change: r2(paid - t.total),
   };
@@ -575,7 +586,7 @@ function receiptLines(s) {
   return L;
 }
 function receiptHtml(lines) {
-  return `<div class="rcpt" style="width:${width() * 0.62 + 2}em">` + lines.map(l => l.img ? `<div class="c"><img src="${l.img}" alt="" style="max-width:55%;max-height:90px;filter:grayscale(1) contrast(1.4)"></div>` : `<div class="${l.a === 'c' ? 'c' : ''} ${l.b ? 'b' : ''} ${l.s === 2 ? 'd' : ''}">${esc(l.t) || ' '}</div>`).join('') + '</div>';
+  return `<div class="rcpt" style="width:${width() * 0.62 + 2}em">` + lines.map(l => l.img ? `<div class="c"><img src="${safeImg(l.img)}" alt="" style="max-width:55%;max-height:90px;filter:grayscale(1) contrast(1.4)"></div>` : `<div class="${l.a === 'c' ? 'c' : ''} ${l.b ? 'b' : ''} ${l.s === 2 ? 'd' : ''}">${esc(l.t) || ' '}</div>`).join('') + '</div>';
 }
 function showReceipt(s) {
   modal(`<h2>${s.void ? 'Voided sale' : 'Sale complete'}</h2>${receiptHtml(receiptLines(s))}
@@ -669,7 +680,7 @@ function poBody() {
     <div class="stat"><b>${db.pos.filter(p => p.status === 'draft').length}</b><span>Drafts</span></div>
     <div class="stat"><b>${money(db.pos.filter(p => p.status === 'received' && (p.receivedTs || 0) >= month).reduce((a, p) => a + p.total, 0))}</b><span>Received this month</span></div></div>
     <div class="chips" style="margin-bottom:14px">${[['all', 'All'], ['draft', 'Drafts'], ['ordered', 'Ordered'], ['received', 'Received'], ['cancelled', 'Cancelled']].map(([k, l]) => `<button class="chip ${poF === k ? 'on' : ''}" data-act="poFilter" data-f="${k}">${l}</button>`).join('')}</div>
-    <div class="group">${list.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="openPo" data-id="${p.id}"><span class="m"><b>${p.no} ${poBadge(p.status)}</b><small>${esc(p.supplierName || '—')} · ${fmtDate(p.ts)} · ${p.items.length} item${p.items.length === 1 ? '' : 's'}</small></span><span class="pr">${money(p.total ?? poTotal(p))}</span></button>`).join('')
+    <div class="group">${list.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="openPo" data-id="${p.id}"><span class="m"><b>${esc(p.no)} ${poBadge(p.status)}</b><small>${esc(p.supplierName || '—')} · ${fmtDate(p.ts)} · ${p.items.length} item${p.items.length === 1 ? '' : 's'}</small></span><span class="pr">${money(p.total ?? poTotal(p))}</span></button>`).join('')
     || '<div class="empty">No purchase orders yet.<br>Tap “New PO” to order stock from a supplier.</div>'}</div>`;
 }
 const suggestQty = p => Math.max((p.low || 0) * 2 - (p.stock || 0), 1);
@@ -707,7 +718,7 @@ function receiveHome() {
   const open = db.pos.filter(p => p.status === 'ordered' || p.status === 'partial');
   modal(`<h2>Receive goods</h2><div class="sub">Record a delivery from a supplier</div>
     <div class="gt" style="margin:0 8px">Against a purchase order</div>
-    <div class="group">${open.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="rcvPo" data-id="${p.id}"><span class="m"><b>${p.no} ${poBadge(p.status)}</b><small>${esc(p.supplierName)} · ${fmtDate(p.ts)}</small></span><span class="pr">${money(poOpenVal(p))}</span></button>`).join('')
+    <div class="group">${open.map(p => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="rcvPo" data-id="${p.id}"><span class="m"><b>${esc(p.no)} ${poBadge(p.status)}</b><small>${esc(p.supplierName)} · ${fmtDate(p.ts)}</small></span><span class="pr">${money(poOpenVal(p))}</span></button>`).join('')
     || '<div class="empty" style="padding:18px">No open purchase orders</div>'}</div>
     <button class="btn big" data-act="rcvDirect">Receive without a PO</button><button class="btn" data-act="close">Cancel</button>`);
 }
@@ -1072,7 +1083,7 @@ function dashView() {
       <div class="card"><h3>Top products</h3>${hbars(tops.map(t => ({ label: t.name, val: t.rev, text: money(t.rev), sub: t.qty + ' sold' })))}</div>
       <div class="card"><h3>Sales by category</h3>${hbars(cats.map(([c, v], i) => ({ label: c, val: v, text: money(v), color: PALETTE[i % PALETTE.length] })))}</div>
       <div class="card"><h3>Payment methods</h3>${pay.length ? `<div class="split">${pay.map(([m, v]) => `<i style="width:${v / payTot * 100}%;background:${PAYC[m] || '#8e8e93'}"></i>`).join('')}</div>
-        ${pay.map(([m, v]) => `<div class="leg"><span><u style="background:${PAYC[m] || '#8e8e93'}"></u>${PAYN[m] || m}</span><b>${money(v)} <small>${Math.round(v / payTot * 100)}%</small></b></div>`).join('')}` : '<div class="empty" style="padding:18px">No data yet</div>'}</div>
+        ${pay.map(([m, v]) => `<div class="leg"><span><u style="background:${PAYC[m] || '#8e8e93'}"></u>${PAYN[m] || esc(m)}</span><b>${money(v)} <small>${Math.round(v / payTot * 100)}%</small></b></div>`).join('')}` : '<div class="empty" style="padding:18px">No data yet</div>'}</div>
       <div class="card"><h3>Top customers</h3>${hbars(Object.entries(a.cust).sort((x, y) => y[1].v - x[1].v).slice(0, 6).map(([n, o]) => ({ label: n, val: o.v, text: money(o.v), sub: o.n + ' visit' + (o.n > 1 ? 's' : '') })), '#ff9500')}
         ${a.orders ? `<div class="gf" style="margin:10px 0 0">Members: ${Math.round(a.memberSales / (a.rev || 1) * 100)}% of sales${lyOn() ? ` · ${a.pts} points issued` : ''}</div>` : ''}</div>
       <div class="card"><h3>Staff performance</h3>${hbars(cash.map(([n, o]) => ({ label: n, val: o.v, text: money(o.v), sub: o.n + ' orders · avg ' + money(o.v / o.n) })), '#5856d6')}</div>
@@ -1149,7 +1160,7 @@ function settingsView() {
       + BTN('changeOwn', 'Change my password') + BTN('log', 'Activity log') + BTN('lock', 'Lock now'), '5 wrong attempts trigger a timed lockout. Anyone with the shop account can read the shop data, so keep it private.')}
     ${G('Shop sync', `<div class="frow" id="cloudStat" style="min-height:64px">${cloudStatHtml()}</div>` + BTN('syncNow', 'Sync now') + BTN('shopOut', 'Disconnect this device', 'dng'),
       'Every device signed in to the same shop account shares this data live. Changes made offline are sent as soon as the connection returns. To add a device: open the app on it and sign in with the shop account.')}
-    ${G('Data', BTN('export', 'Export encrypted backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} CSV files are NOT encrypted — keep them private.`)}${aboutGroup()}</div>`;
+    ${G('Data', BTN('export', 'Export backup') + BTN('import', 'Restore from backup') + BTN('csv', 'Export sales to Excel (CSV)') + BTN('reset', 'Erase all data', 'dng'), `${last} Backup and CSV files are NOT encrypted — keep them private.`)}${aboutGroup()}</div>`;
 }
 
 /* ---------- team + security sheets (admin) ---------- */
@@ -1215,7 +1226,7 @@ function askSecret(title, text, cb) {
   askSecret.cb = cb; setTimeout(() => { const i = $('#aPw'); i && i.focus(); }, 60);
 }
 
-/* ---------- backup / restore (stays encrypted) ---------- */
+/* ---------- backup / restore ---------- */
 const toB = u => { let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
 const fromB = b => Uint8Array.from(atob(b), c => c.charCodeAt(0));
 async function exportBackup() {
@@ -1224,7 +1235,7 @@ async function exportBackup() {
   const json = JSON.stringify(dump, (k, v) => v instanceof Uint8Array ? { $b: toB(v) } : v);
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
   a.download = `epos-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click();
-  meta.lastBackup = Date.now(); saveMeta(); logEv('backup', 'Exported encrypted backup'); render();
+  meta.lastBackup = Date.now(); saveMeta(); logEv('backup', 'Exported backup'); render();
 }
 let restoreMode = false;
 async function importBackup(file) {
