@@ -36,7 +36,7 @@ Deploy: unggah ulang file yang berubah ke host (GitHub Pages). Aplikasi perlu di
 - Peran admin/kasir ditegakkan di dalam aplikasi; penegakan di sisi server hanya aktif jika `rls_roles.sql` sudah dijalankan. Menurut README, belum diuji di proyek live.
 - Stok disimpan sebagai pergerakan +/- (bukan angka tunggal), supaya dua perangkat yang bertransaksi bersamaan tidak saling menimpa. Pertahankan pola ini.
 - Catatan sinkronisasi ada di bagian "SHOP SYNC" `app.js`: tabel punya dua kolom kunci dan satu kolom JSON. Pindah backend berarti menulis ulang fungsi kirim/ambil/live di bagian itu.
-- Setelah mengubah `app.js`, `style.css`, atau `index.html`, naikkan nama cache di `sw.js` (konstanta `C`, saat ini `'epos-v21'`) agar perangkat yang sudah memasang aplikasi mengambil versi baru. `sw.js` tidak men-cache permintaan lintas-origin (API Supabase/Google).
+- Setelah mengubah `app.js`, `style.css`, atau `index.html`, naikkan nama cache di `sw.js` (konstanta `C`, saat ini `'epos-v22'`) agar perangkat yang sudah memasang aplikasi mengambil versi baru. `sw.js` tidak men-cache permintaan lintas-origin (API Supabase/Google).
 - Jangan menyimpan password atau PIN apa pun di kode. Hash PBKDF2 disimpan di baris `creds` di database.
 
 ## Git
