@@ -567,7 +567,7 @@ function receiptLines(s) {
   const W = width(), L = [], st = S(), dash = '-'.repeat(W);
   const add = (t, o = {}) => L.push({ t: asc(t), ...o });
   if (meta.logo && st.printLogo !== false) L.push({ img: meta.logo, a: 'c', t: '' });
-  wrap(asc(st.store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2 }));
+  wrap(asc(st.store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2, f: 'serif' }));
   if (st.addr) wrap(asc(st.addr), W).forEach(t => add(t, { a: 'c' }));
   if (st.phone) add('Tel: ' + st.phone, { a: 'c' });
   add(dash); add('No: ' + s.no);
@@ -591,7 +591,7 @@ function receiptLines(s) {
   return L;
 }
 function receiptHtml(lines) {
-  return `<div class="rcpt" style="width:${width() * 0.62 + 2}em">` + lines.map(l => l.img ? `<div class="c"><img src="${safeImg(l.img)}" alt="" style="max-width:55%;max-height:90px;filter:grayscale(1) contrast(1.4)"></div>` : `<div class="${l.a === 'c' ? 'c' : ''} ${l.b ? 'b' : ''} ${l.s === 2 ? 'd' : ''}">${esc(l.t) || ' '}</div>`).join('') + '</div>';
+  return `<div class="rcpt" style="width:${width() * 0.62 + 2}em">` + lines.map(l => l.img ? `<div class="c"><img src="${safeImg(l.img)}" alt="" style="max-width:55%;max-height:90px;filter:grayscale(1) contrast(1.4)"></div>` : `<div class="${l.a === 'c' ? 'c' : ''} ${l.b ? 'b' : ''} ${l.s === 2 ? 'd' : ''} ${l.f === 'serif' ? 'sf' : ''}">${esc(l.t) || ' '}</div>`).join('') + '</div>';
 }
 function showReceipt(s) {
   modal(`<h2>${s.void ? 'Voided sale' : 'Sale complete'}</h2>${receiptHtml(receiptLines(s))}
@@ -780,7 +780,7 @@ function grnBody() {
 }
 const grnLines = g => {
   const W = width(), L = [], dash = '-'.repeat(W), add = (t, o = {}) => L.push({ t: asc(t), ...o });
-  wrap(asc(S().store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2 })); add('GOODS RECEIVED', { a: 'c', b: 1 }); add(g.no, { a: 'c' }); add(dash);
+  wrap(asc(S().store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2, f: 'serif' })); add('GOODS RECEIVED', { a: 'c', b: 1 }); add(g.no, { a: 'c' }); add(dash);
   add(new Date(g.ts).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })); wrap('From: ' + asc(g.supplierName), W).forEach(t => add(t));
   if (g.poNo) add('PO: ' + g.poNo); if (g.invoice) add('Invoice: ' + asc(g.invoice)); add(dash);
   g.items.forEach(i => { wrap(asc(i.name), W).forEach(t => add(t)); add(lr(`  ${i.qty} x ${pm(i.cost)}`, pm(i.qty * i.cost), W)); });
@@ -797,7 +797,7 @@ function grnSheet(g) {
 }
 function poLines(p) {
   const W = width(), L = [], dash = '-'.repeat(W), add = (t, o = {}) => L.push({ t: asc(t), ...o });
-  wrap(asc(S().store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2 })); add('PURCHASE ORDER', { a: 'c', b: 1 }); add(p.no, { a: 'c' }); add(dash);
+  wrap(asc(S().store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2, f: 'serif' })); add('PURCHASE ORDER', { a: 'c', b: 1 }); add(p.no, { a: 'c' }); add(dash);
   add('Date: ' + new Date(p.ts).toLocaleDateString()); wrap('To: ' + asc(p.supplierName || ''), W).forEach(t => add(t)); add(dash);
   p.items.forEach(i => { wrap(asc(i.name), W).forEach(t => add(t)); add(lr(`  ${i.qty} x ${pm(i.cost)}`, pm(i.qty * i.cost), W)); });
   add(dash); add(lr('TOTAL', pm(poTotal(p)), W), { b: 1 }); if (p.note) { add(dash); wrap(asc(p.note), W).forEach(t => add(t)); }
@@ -1098,7 +1098,7 @@ function dashView() {
 }
 function reportLines(R) {
   const a = agg(inRange(R.from, R.to)), W = width(), L = [], dash = '-'.repeat(W), add = (t, o = {}) => L.push({ t: asc(t), ...o });
-  wrap(asc(S().store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2 }));
+  wrap(asc(S().store), W / 2 | 0).forEach(t => add(t, { a: 'c', b: 1, s: 2, f: 'serif' }));
   add('SALES REPORT', { a: 'c', b: 1 }); add(R.label, { a: 'c' });
   add(new Date().toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }), { a: 'c' }); add(dash);
   add(lr('Orders', a.orders, W)); add(lr('Items sold', a.items, W)); add(dash);
