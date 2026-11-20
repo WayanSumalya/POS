@@ -1,1 +1,15 @@
 .claude/
+
+# Rahasia
+.env
+.env.*
+!.env.example
+
+# Dependensi dan cache lokal
+node_modules/
+graphify-out/
+
+# Sistem
+Thumbs.db
+.DS_Store
+*.log
