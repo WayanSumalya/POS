@@ -984,7 +984,7 @@ function productForm(p) {
   imgDraft = p.img || null;
   modal(`<h2>${n ? 'New item' : 'Edit item'}</h2>
     <div class="photo"><span class="pim" id="pPrev" style="background:${hue(p.cat || p.name || 'x')}">${picHtml(p)}</span>
-      <div class="stack"><button class="btn sm" data-act="pickImg">${ICON.plus} Take / choose photo</button><button class="btn sm dng" data-act="rmImg">Remove photo</button></div></div>
+      <div class="stack"><button class="btn sm" data-act="pickImg">${ICON.plus} Take photo</button><button class="btn sm" data-act="pickImgLib">Gallery</button><button class="btn sm dng" data-act="rmImg">Remove photo</button></div></div>
     <div class="group">${R('Name', inp('fName', p.name, 'autocomplete="off"'))}${R('Icon (emoji)', inp('fIcon', p.icon || '', 'maxlength="4" placeholder="optional"'))}
     ${R('Category', inp('fCat', p.cat, 'list="cats" autocomplete="off"') + `<datalist id="cats">${[...new Set(db.products.map(x => x.cat).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist>`)}
     ${R('SKU / barcode', inp('fSku', p.sku, 'autocomplete="off"') + `<button class="x2" style="color:var(--tint)" data-act="scanSku" aria-label="Scan">${ICON.scan}</button>`)}</div>
@@ -1137,7 +1137,7 @@ const printerRows = () => {
 function profileCard() {
   const u = uById(me.id);
   return `<div class="group"><div class="row" style="min-height:92px">${avatar(u, 'xl')}<span class="m"><b style="font-size:20px">${esc(me.name)}</b><small>${isAdmin() ? 'Administrator' : 'Cashier'}</small></span>
-    <span class="stack" style="align-items:flex-end"><button class="btn sm" data-act="pickAv" data-id="${u.id}">${u.avatar ? 'Change photo' : 'Add photo'}</button>${u.avatar ? `<button class="btn sm dng" data-act="rmAv" data-id="${u.id}">Remove</button>` : ''}</span></div></div>`;
+    <span class="stack" style="align-items:flex-end"><button class="btn sm" data-act="pickAv" data-id="${u.id}">${u.avatar ? 'Change photo' : 'Add photo'}</button><button class="btn sm" data-act="pickAvLib" data-id="${u.id}">Gallery</button>${u.avatar ? `<button class="btn sm dng" data-act="rmAv" data-id="${u.id}">Remove</button>` : ''}</span></div></div>`;
 }
 function accountView() {
   return `<div class="page"><div class="head"><h1>Account</h1></div>
@@ -1149,7 +1149,7 @@ function settingsView() {
   const s = S(), last = meta.lastBackup ? `Last backup: ${fmtDate(meta.lastBackup)}` : 'No backup made yet — export one now.';
   return `<div class="page"><div class="head"><h1>Settings</h1></div>
     ${profileCard()}
-    ${G('Store (on receipts)', `<div class="frow" style="min-height:76px"><span>Shop logo</span><span style="margin-left:auto;display:flex;align-items:center;gap:12px">${brandMark('md')}<span class="stack"><button class="btn sm" data-act="pickLogo">${meta.logo ? 'Change' : 'Add logo'}</button>${meta.logo ? '<button class="btn sm dng" data-act="rmLogo">Remove</button>' : ''}</span></span></div>`
+    ${G('Store (on receipts)', `<div class="frow" style="min-height:76px"><span>Shop logo</span><span style="margin-left:auto;display:flex;align-items:center;gap:12px">${brandMark('md')}<span class="stack"><button class="btn sm" data-act="pickLogo">${meta.logo ? 'Change' : 'Add logo'}</button><button class="btn sm" data-act="pickLogoLib">Gallery</button>${meta.logo ? '<button class="btn sm dng" data-act="rmLogo">Remove</button>' : ''}</span></span></div>`
       + (meta.logo ? R('Print logo on receipts', `<input type="checkbox" class="sw" data-set="printLogo" ${s.printLogo !== false ? 'checked' : ''}>`) : '')
       + setIn('store', 'Store name') + setIn('addr', 'Address') + setIn('phone', 'Phone') + setIn('footer', 'Footer'))}
     ${G('Sales', setIn('cur', 'Currency symbol') + R('Decimals', `<select data-set="dec"><option value="0" ${+s.dec === 0 ? 'selected' : ''}>0 (1,000)</option><option value="2" ${+s.dec === 2 ? 'selected' : ''}>2 (1,000.00)</option></select>`)
@@ -1173,7 +1173,7 @@ let UF = { role: 'cashier' };
 function userSheet(u) {
   const role = u ? u.role : UF.role, pin = role !== 'admin'; modalUser = u ? u.id : null;
   modal(`<h2>${u ? esc(u.name) : 'New user'}</h2>${u ? `<div class="sub">${role === 'admin' ? 'Administrator' : 'Cashier'}</div>
-    <div class="photo" style="justify-content:center">${avatar(u, 'xl')}<div class="stack"><button class="btn sm" data-act="pickAv" data-id="${u.id}">${u.avatar ? 'Change photo' : 'Add photo'}</button>${u.avatar ? `<button class="btn sm dng" data-act="rmAv" data-id="${u.id}">Remove photo</button>` : ''}</div></div>` : ''}
+    <div class="photo" style="justify-content:center">${avatar(u, 'xl')}<div class="stack"><button class="btn sm" data-act="pickAv" data-id="${u.id}">${u.avatar ? 'Change photo' : 'Add photo'}</button><button class="btn sm" data-act="pickAvLib" data-id="${u.id}">Gallery</button>${u.avatar ? `<button class="btn sm dng" data-act="rmAv" data-id="${u.id}">Remove photo</button>` : ''}</div></div>` : ''}
     ${u ? '' : `<div class="group"><label class="frow"><span>Name</span><input id="uName" autocomplete="off" value="${esc(UF.name || '')}"></label></div>
     <div class="seg"><button class="${role === 'cashier' ? 'on' : ''}" data-act="urole" data-r="cashier">Cashier</button><button class="${role === 'admin' ? 'on' : ''}" data-act="urole" data-r="admin">Administrator</button></div>`}
     <div class="group"><label class="frow"><span>${u ? 'New ' : ''}${pin ? 'PIN' : 'Password'}</span><input id="uSec" type="password" autocomplete="new-password" ${pin ? 'inputmode="numeric" maxlength="6" placeholder="6 digits"' : 'placeholder="8+ characters"'}></label>
@@ -1495,7 +1495,7 @@ addEventListener('online', () => { if (syncSt && sb && me) syncFlush({ pull: tru
 addEventListener('offline', uiSync);
 setInterval(() => { if (syncSt && sb && me && !sbLive) syncFlush({ pull: true }); }, 30000); // safety net if the live connection drops
 
-const ADMIN_ONLY = new Set(['dp', 'repPrint', 'repCsv', 'repCsv2', 'pickImg', 'rmImg', 'sf', 'sadj', 'edit', 'newProd', 'saveProd', 'delProd', 'void', 'export', 'csv', 'import', 'reset', 'userNew', 'userEdit', 'saveUser', 'removeUser', 'urole', 'log', 'shopOut', 'syncNow']);
+const ADMIN_ONLY = new Set(['dp', 'repPrint', 'repCsv', 'repCsv2', 'pickImg', 'pickImgLib', 'rmImg', 'sf', 'sadj', 'edit', 'newProd', 'saveProd', 'delProd', 'void', 'export', 'csv', 'import', 'reset', 'userNew', 'userEdit', 'saveUser', 'removeUser', 'urole', 'log', 'shopOut', 'syncNow']);
 const ADMIN_RE = /^(scan(Sku|Inv|Count|Po|Rcv)|po[A-Z]|sup|cnt|rc|grn|newPo|newCount|startCount|itab|openPo|pickLogo|rmLogo|custEdit|custAdj|custDel|custCsv)/;
 const A = {
   nav: d => { view = d.v; render(); },
@@ -1522,7 +1522,7 @@ const A = {
   },
   sf: d => { stockF = d.f; render(); }, salf: d => { salesF = d.f; render(); },
   sadj: d => { const p = prod(d.id), n = p.stock + +d.d; if (n < 0) return; logEv('stock', `${p.name}: stock ${p.stock} → ${n}`); setStock(p, n); updateStock(); },
-  pickImg: () => $('#imgFile').click(),
+  pickImg: () => $('#imgFile').click(), pickImgLib: () => $('#imgFileLib').click(),
   rmImg: () => { imgDraft = null; const n = ($('#fName') || {}).value || 'x'; $('#pPrev').innerHTML = esc(($('#fIcon').value || n)[0].toUpperCase()); },
   edit: d => productForm(prod(d.id)), newProd: () => productForm(null), saveProd: d => saveProd(d.id),
   delProd: d => { const p = prod(d.id); if (confirm('Delete this item? Past sales keep their records.')) { db.products = db.products.filter(x => x.id !== d.id); cart = cart.filter(c => c.id !== d.id); IDB.del('products', d.id); logEv('item', `Deleted item ${p.name}`); closeModal(); render(); } },
@@ -1592,8 +1592,9 @@ const A = {
   cntDiscard: () => { if (!confirm('Discard this count? Nothing will change in stock.')) return; db.counts = db.counts.filter(x => x.id !== cnt.id); IDB.del('counts', cnt.id); cnt = null; render(); },
   /* photos + logo */
   pickAv: d => { if (d.id !== me.id && !isAdmin()) return; avTarget = d.id; $('#avFile').click(); },
+  pickAvLib: d => { if (d.id !== me.id && !isAdmin()) return; avTarget = d.id; $('#avFileLib').click(); },
   rmAv: d => { if (d.id !== me.id && !isAdmin()) return; const u = uById(d.id); delete u.avatar; saveMeta(); render(); if (modalUser) userSheet(uById(modalUser)); },
-  pickLogo: () => $('#logoFile').click(),
+  pickLogo: () => $('#logoFile').click(), pickLogoLib: () => $('#logoFileLib').click(),
   rmLogo: () => { delete meta.logo; saveMeta(); render(); },
   dp: d => { dashP = d.p; render(); },
   repPrint: () => printLines(reportLines(rangeFor(dashP))),
@@ -1686,18 +1687,21 @@ document.addEventListener('change', e => {
     if (['method', 'paper', 'dec', 'cur', 'store', 'loyaltyOn', 'earnPer', 'ptValue'].includes(k)) render();
   } else if (t.dataset.meta && isAdmin()) { meta[t.dataset.meta] = +t.value; saveMeta(); bump(); }
 });
-$('#imgFile').addEventListener('change', async e => {
+const onImgFile = async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f || !isAdmin() || !$('#pPrev')) return;
   try { imgDraft = await resizeImg(f); $('#pPrev').innerHTML = `<img src="${imgDraft}" alt="">`; } catch (err) { toast('Could not read that image', true); }
-});
-$('#avFile').addEventListener('change', async e => {
+};
+$('#imgFile').addEventListener('change', onImgFile); $('#imgFileLib').addEventListener('change', onImgFile);
+const onAvFile = async e => {
   const f = e.target.files[0]; e.target.value = ''; const u = f && uById(avTarget); if (!u || (u.id !== me.id && !isAdmin())) return;
   try { u.avatar = await resizeImg(f, 220); await saveMeta(); render(); if (modalUser) userSheet(uById(modalUser)); toast('Photo updated'); } catch (err) { toast('Could not read that image', true); }
-});
-$('#logoFile').addEventListener('change', async e => {
+};
+$('#avFile').addEventListener('change', onAvFile); $('#avFileLib').addEventListener('change', onAvFile);
+const onLogoFile = async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f || !isAdmin()) return;
   try { meta.logo = await resizeFit(f); await saveMeta(); render(); toast('Logo updated'); } catch (err) { toast('Could not read that image', true); }
-});
+};
+$('#logoFile').addEventListener('change', onLogoFile); $('#logoFileLib').addEventListener('change', onLogoFile);
 $('#importFile').addEventListener('change', e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
   if (me && !isAdmin()) return toast('Administrator only', true);

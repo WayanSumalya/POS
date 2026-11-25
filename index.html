@@ -20,9 +20,12 @@
 <div id="toast"></div>
 <div id="printArea"></div>
 <input type="file" id="importFile" accept="application/json" hidden>
-<input type="file" id="imgFile" accept="image/*" hidden>
-<input type="file" id="avFile" accept="image/*" hidden>
-<input type="file" id="logoFile" accept="image/*" hidden>
+<input type="file" id="imgFile" accept="image/*" capture="environment" hidden>
+<input type="file" id="imgFileLib" accept="image/*" hidden>
+<input type="file" id="avFile" accept="image/*" capture="environment" hidden>
+<input type="file" id="avFileLib" accept="image/*" hidden>
+<input type="file" id="logoFile" accept="image/*" capture="environment" hidden>
+<input type="file" id="logoFileLib" accept="image/*" hidden>
 <script src="supabase.js"></script>
 <script src="app.js"></script>
 </body>
