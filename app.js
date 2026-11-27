@@ -986,7 +986,7 @@ function productForm(p) {
   imgDraft = p.img || null;
   modal(`<h2>${n ? 'New item' : 'Edit item'}</h2>
     <div class="photo"><span class="pim" id="pPrev" style="background:${hue(p.cat || p.name || 'x')}">${picHtml(p)}</span>
-      <div class="stack"><button class="btn sm" data-act="pickImg">${ICON.plus} Take / choose photo</button><button class="btn sm dng" data-act="rmImg">Remove photo</button></div></div>
+      <div class="stack"><button class="btn sm" data-act="pickImgCam">${ICON.plus} Take photo</button><button class="btn sm" data-act="pickImg">Choose photo</button><button class="btn sm dng" data-act="rmImg">Remove photo</button></div></div>
     <div class="group">${R('Name', inp('fName', p.name, 'autocomplete="off"'))}${R('Icon (emoji)', inp('fIcon', p.icon || '', 'maxlength="4" placeholder="optional"'))}
     ${R('Category', inp('fCat', p.cat, 'list="cats" autocomplete="off"') + `<datalist id="cats">${[...new Set(db.products.map(x => x.cat).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist>`)}
     ${R('SKU / barcode', inp('fSku', p.sku, 'autocomplete="off"') + `<button class="x2" style="color:var(--tint)" data-act="scanSku" aria-label="Scan">${ICON.scan}</button>`)}</div>
@@ -1499,7 +1499,7 @@ addEventListener('online', () => { if (syncSt && sb && me) syncFlush({ pull: tru
 addEventListener('offline', uiSync);
 setInterval(() => { if (syncSt && sb && me && !sbLive) syncFlush({ pull: true }); }, 30000); // safety net if the live connection drops
 
-const ADMIN_ONLY = new Set(['dp', 'repPrint', 'repCsv', 'repCsv2', 'pickImg', 'rmImg', 'sf', 'sadj', 'edit', 'newProd', 'saveProd', 'delProd', 'void', 'export', 'csv', 'import', 'reset', 'userNew', 'userEdit', 'saveUser', 'removeUser', 'urole', 'log', 'shopOut', 'syncNow']);
+const ADMIN_ONLY = new Set(['dp', 'repPrint', 'repCsv', 'repCsv2', 'pickImg', 'pickImgCam', 'rmImg', 'sf', 'sadj', 'edit', 'newProd', 'saveProd', 'delProd', 'void', 'export', 'csv', 'import', 'reset', 'userNew', 'userEdit', 'saveUser', 'removeUser', 'urole', 'log', 'shopOut', 'syncNow']);
 const ADMIN_RE = /^(scan(Sku|Inv|Count|Po|Rcv)|po[A-Z]|sup|cnt|rc|grn|newPo|newCount|startCount|itab|openPo|pickLogo|rmLogo|custEdit|custAdj|custDel|custCsv)/;
 const A = {
   nav: d => { view = d.v; render(); },
@@ -1527,7 +1527,7 @@ const A = {
   },
   sf: d => { stockF = d.f; render(); }, salf: d => { salesF = d.f; render(); },
   sadj: d => { const p = prod(d.id), n = p.stock + +d.d; if (n < 0) return; logEv('stock', `${p.name}: stock ${p.stock} → ${n}`); setStock(p, n); updateStock(); },
-  pickImg: () => $('#imgFile').click(),
+  pickImg: () => $('#imgFile').click(), pickImgCam: () => $('#imgFileCam').click(),
   rmImg: () => { imgDraft = null; const n = ($('#fName') || {}).value || 'x'; $('#pPrev').innerHTML = esc(($('#fIcon').value || n)[0].toUpperCase()); },
   edit: d => productForm(prod(d.id)), newProd: () => productForm(null), saveProd: d => saveProd(d.id),
   delProd: d => { const p = prod(d.id); if (confirm('Delete this item? Past sales keep their records.')) { db.products = db.products.filter(x => x.id !== d.id); cart = cart.filter(c => c.id !== d.id); IDB.del('products', d.id); logEv('item', `Deleted item ${p.name}`); closeModal(); render(); } },
@@ -1691,10 +1691,12 @@ document.addEventListener('change', e => {
     if (['method', 'paper', 'dec', 'cur', 'store', 'loyaltyOn', 'earnPer', 'ptValue'].includes(k)) render();
   } else if (t.dataset.meta && isAdmin()) { meta[t.dataset.meta] = +t.value; saveMeta(); bump(); }
 });
-$('#imgFile').addEventListener('change', async e => {
+async function pickedProdImg(e) {
   const f = e.target.files[0]; e.target.value = ''; if (!f || !isAdmin() || !$('#pPrev')) return;
   try { imgDraft = await resizeImg(f); $('#pPrev').innerHTML = `<img src="${imgDraft}" alt="">`; } catch (err) { toast('Could not read that image', true); }
-});
+}
+$('#imgFile').addEventListener('change', pickedProdImg);
+$('#imgFileCam').addEventListener('change', pickedProdImg);
 $('#avFile').addEventListener('change', async e => {
   const f = e.target.files[0]; e.target.value = ''; const u = f && uById(avTarget); if (!u || (u.id !== me.id && !isAdmin())) return;
   try { u.avatar = await resizeImg(f, 220); await saveMeta(); render(); if (modalUser) userSheet(uById(modalUser)); toast('Photo updated'); } catch (err) { toast('Could not read that image', true); }
