@@ -380,7 +380,7 @@ const scanHandlers = {
     const p = bySku(code);
     if (p) return addToCart(p.id) ? { ok: true, msg: `✓ ${p.name} · ${cart.find(c => c.id === p.id).qty} in order` } : { ok: false, msg: `${p.name}: not enough stock` };
     const c = db.customers.find(x => (x.no || '').toLowerCase() === code.toLowerCase() || (digits(code).length >= 6 && digits(x.phone) === digits(code)));
-    if (c) { custId = c.id; updateCart(); return { ok: true, msg: `✓ Customer: ${c.name}` }; }
+    if (c) { custId = c.id; updateGrid(); updateCart(); return { ok: true, msg: `✓ Customer: ${c.name}` }; }
     return { ok: false, msg: `No item or customer for ${code}` };
   },
   sku: code => { const i = $('#fSku'); if (i) i.value = code; const other = bySku(code); return { ok: true, msg: other && other.id !== (($('[data-act=saveProd]') || {}).dataset || {}).id ? `✓ ${code} (already used by ${other.name})` : `✓ ${code}` }; },
@@ -446,17 +446,18 @@ function updateGrid() {
     const n = (cart.find(c => c.id === p.id) || {}).qty, out = p.stock !== null && p.stock <= 0, low = p.stock !== null && p.stock <= p.low;
     return `<button class="tile ${out ? 'out' : low ? 'low' : ''}" data-act="add" data-id="${p.id}">
       <span class="tim" style="background:${hue(p.cat || p.name)}">${picHtml(p)}</span>
-      <span class="tn">${esc(p.name)}</span><span class="tr"><span class="tp">${money(p.price)}</span>${p.stock !== null ? `<span class="ts">${out ? 'Out' : p.stock}</span>` : ''}</span>
+      <span class="tn">${esc(p.name)}</span><span class="tr"><span class="tp">${money(priceFor(p))}</span>${p.stock !== null ? `<span class="ts">${out ? 'Out' : p.stock}</span>` : ''}</span>
       ${n ? `<b class="qb">${n}</b>` : ''}</button>`;
   }).join('') || `<div class="empty" style="grid-column:1/-1">${db.products.length ? 'No items found' : isAdmin() ? 'No items yet.<br>Add them in Inventory.' : 'No items yet.<br>Ask an administrator to add items.'}</div>`;
 }
 /* ---------- loyalty ---------- */
 const lyOn = () => S().loyaltyOn !== false;
 const cust = id => db.customers.find(c => c.id === id) || null;
+const priceFor = p => { const c = cust(custId); return c && c.type === 'reseller' && p.priceR > 0 ? p.priceR : p.price; };
 const earnPts = base => lyOn() && +S().earnPer > 0 ? Math.floor(Math.max(base, 0) / +S().earnPer) : 0;
 const ptsValue = n => r2(n * (+S().ptValue || 0));
 function totals(disc, rv = 0) { // rv = value of redeemed loyalty points
-  const sub = r2(cart.reduce((a, c) => a + prod(c.id).price * c.qty, 0));
+  const sub = r2(cart.reduce((a, c) => a + priceFor(prod(c.id)) * c.qty, 0));
   const d = r2(Math.min(Math.max(+disc || 0, 0), sub)), r = r2(Math.min(Math.max(+rv || 0, 0), sub - d)), tax = r2((sub - d - r) * (+S().tax || 0) / 100);
   return { sub, disc: d, redeem: r, tax, total: r2(sub - d - r + tax) };
 }
@@ -464,7 +465,7 @@ const ckRv = () => ck && ck.pts ? ptsValue(ck.pts) : 0;
 function custRow() {
   if (!lyOn() && !custId) return '';
   const c = cust(custId);
-  return `<div class="custrow">${c ? `<button class="m" data-act="custPick" style="text-align:left">${avatar(null, '')}<span class="m"><b>${esc(c.name)}</b><small>${lyOn() ? c.points + ' points' : esc(c.phone || '')}</small></span></button><button class="x2" data-act="custClear" aria-label="Remove customer">${ICON.x}</button>`
+  return `<div class="custrow">${c ? `<button class="m" data-act="custPick" style="text-align:left">${avatar(null, '')}<span class="m"><b>${esc(c.name)}${c.type === 'reseller' ? ' · Reseller' : ''}</b><small>${lyOn() ? c.points + ' points' : esc(c.phone || '')}</small></span></button><button class="x2" data-act="custClear" aria-label="Remove customer">${ICON.x}</button>`
     : `<button class="btn sm" data-act="custPick" style="width:100%">${ICON.account} Add customer${lyOn() ? ' · earn points' : ''}</button>`}</div>`;
 }
 function updateCart() {
@@ -472,8 +473,8 @@ function updateCart() {
   const t = totals(discount), count = cart.reduce((a, c) => a + c.qty, 0);
   $('#cart').innerHTML = `
     <div class="ch"><h2>Order</h2>${cart.length ? '<button class="btn sm dng" data-act="clear">Clear</button>' : ''}<button class="btn sm x" data-act="cartClose">Done</button></div>
-    <div class="lines">${cart.length ? cart.map(c => { const p = prod(c.id); return `
-      <div class="line"><div><div class="ln">${esc(p.name)}</div><div class="lu">${money(p.price)}</div></div><div class="lt">${money(p.price * c.qty)}</div>
+    <div class="lines">${cart.length ? cart.map(c => { const p = prod(c.id), pr = priceFor(p); return `
+      <div class="line"><div><div class="ln">${esc(p.name)}</div><div class="lu">${money(pr)}</div></div><div class="lt">${money(pr * c.qty)}</div>
         <button class="rm" data-act="rm" data-id="${c.id}">Remove</button>
         <div class="step" style="justify-self:end"><button data-act="dec" data-id="${c.id}">−</button><span>${c.qty}</span><button data-act="inc" data-id="${c.id}">+</button></div></div>`; }).join('')
       : '<div class="empty">Tap items to start an order</div>'}</div>
@@ -536,7 +537,7 @@ function finishSale(print) {
   }
   const sale = {
     id: uid(), no: 'INV-' + String(++db.seq).padStart(5, '0') + '-' + devTag(), ts: Date.now(), cashier: { id: me.id, name: me.name },
-    items: cart.map(c => { const p = prod(c.id); return { id: p.id, name: p.name, price: p.price, cost: p.cost || 0, qty: c.qty }; }),
+    items: cart.map(c => { const p = prod(c.id); return { id: p.id, name: p.name, price: priceFor(p), cost: p.cost || 0, qty: c.qty }; }),
     ...t, method, paid: r2(paid), change: r2(paid - t.total),
   };
   if (c) { // loyalty: update the customer record
@@ -839,7 +840,7 @@ function updateCust() {
   list = list.slice().sort(cuF === 'top' ? (a, b) => (b.spent || 0) - (a.spent || 0) : cuF === 'recent' ? (a, b) => (b.lastVisit || 0) - (a.lastVisit || 0) : cuF === 'pts' ? (a, b) => b.points - a.points : (a, b) => a.name.localeCompare(b.name));
   $('#custList').innerHTML = list.map(c => custRowHtml(c, 'custOpen')).join('') || '<div class="empty">No customers yet.<br>Add customers to track purchases and loyalty points.</div>';
 }
-const custRowHtml = (c, act) => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="${act}" data-id="${c.id}">${avatar(null)}<span class="m"><b>${esc(c.name)}</b><small>${esc([c.phone, (c.visits || 0) + ' visit' + (c.visits === 1 ? '' : 's')].filter(Boolean).join(' · '))}</small></span>
+const custRowHtml = (c, act) => `<button class="row rowb" style="width:100%;padding:10px 16px" data-act="${act}" data-id="${c.id}">${avatar(null)}<span class="m"><b>${esc(c.name)}${c.type === 'reseller' ? ' · Reseller' : ''}</b><small>${esc([c.phone, (c.visits || 0) + ' visit' + (c.visits === 1 ? '' : 's')].filter(Boolean).join(' · '))}</small></span>
   <span class="pr">${lyOn() ? c.points + ' pts' : money(c.spent || 0)}${lyOn() ? `<small style="font-weight:400;color:var(--l2)">${money(c.spent || 0)}</small>` : ''}</span></button>`;
 function custSheet(id) {
   const c = cust(id); if (!c) return closeModal();
@@ -847,7 +848,7 @@ function custSheet(id) {
   const adj = (c.adj || []).map(a => ({ ts: a.ts, t: `Adjustment${a.reason ? ': ' + esc(a.reason) : ''} · ${esc(a.by)}`, r: (a.delta > 0 ? '+' : '') + a.delta + ' pts' }));
   const hist = [...sales, ...adj].sort((a, b) => b.ts - a.ts).slice(0, 10);
   const row = (l, v) => v ? `<div class="frow"><span>${l}</span><span style="margin-left:auto;text-align:right;color:var(--l2)">${esc(v)}</span></div>` : '';
-  modal(`<h2>${esc(c.name)}</h2><div class="sub">${esc(c.no)} · member since ${new Date(c.created).toLocaleDateString()}</div>
+  modal(`<h2>${esc(c.name)}${c.type === 'reseller' ? ' · Reseller' : ''}</h2><div class="sub">${esc(c.no)} · member since ${new Date(c.created).toLocaleDateString()}</div>
     <div class="stats" style="margin:0">${lyOn() ? `<div class="stat"><b>${c.points}</b><span>Points (${money(ptsValue(c.points))})</span></div>` : ''}<div class="stat"><b>${c.visits || 0}</b><span>Visits</span></div><div class="stat"><b>${money(c.spent || 0)}</b><span>Total spent</span></div>
       <div class="stat"><b>${money(c.visits ? c.spent / c.visits : 0)}</b><span>Avg visit</span></div></div>
     ${row('Phone', c.phone)}${row('Email', c.email)}${row('Birthday', c.birthday)}${row('Note', c.note)}
@@ -857,10 +858,11 @@ function custSheet(id) {
     <button class="btn" data-act="close">Close</button>`);
 }
 function customerForm(id, ret) {
-  const c = id ? cust(id) : { name: '', phone: '', email: '', birthday: '', note: '' }; cuRet = ret || null;
+  const c = id ? cust(id) : { name: '', phone: '', email: '', birthday: '', note: '', type: 'retail' }; cuRet = ret || null;
   const pre = !id && ret === 'pick' && cpQ.trim() ? (digits(cpQ).length >= 6 ? { phone: cpQ.trim() } : { name: cpQ.trim() }) : {};
   const f = (l, k, ex = '') => `<label class="frow"><span>${l}</span><input id="cu_${k}" value="${esc(pre[k] ?? c[k] ?? '')}" ${ex}></label>`;
-  modal(`<h2>${id ? 'Edit customer' : 'New customer'}</h2><div class="group">${f('Name', 'name', 'autocomplete="off"')}${f('Phone', 'phone', 'type="tel" inputmode="tel"')}${f('Email', 'email', 'type="email"')}${f('Birthday', 'birthday', 'type="date"')}${f('Note', 'note')}</div>
+  modal(`<h2>${id ? 'Edit customer' : 'New customer'}</h2><div class="group">${f('Name', 'name', 'autocomplete="off"')}${f('Phone', 'phone', 'type="tel" inputmode="tel"')}${f('Email', 'email', 'type="email"')}${f('Birthday', 'birthday', 'type="date"')}${f('Note', 'note')}
+    <label class="frow"><span>Customer type</span><select id="cu_type">${['retail', 'reseller'].map(t => `<option value="${t}" ${(c.type || 'retail') === t ? 'selected' : ''}>${t === 'retail' ? 'Retail' : 'Reseller'}</option>`).join('')}</select></label></div>
     <button class="btn pri big" data-act="custSave" data-id="${id || ''}">Save</button><button class="btn" data-act="custFormBack" data-id="${id || ''}">Cancel</button>`);
 }
 function saveCustomer(id) {
@@ -869,7 +871,7 @@ function saveCustomer(id) {
   const ph = digits(g('phone')), dup = ph.length >= 6 && db.customers.find(x => x.id !== id && digits(x.phone) === ph); if (dup) return toast(`Phone already registered to ${dup.name}`, true);
   let c = id ? cust(id) : null;
   if (!c) { c = { id: uid(), no: nextNo('C-', db.customers), points: 0, spent: 0, visits: 0, created: Date.now(), adj: [] }; c.ts = c.created; db.customers.push(c); logEv('customer', `Added customer ${g('name')}`); }
-  Object.assign(c, { name: g('name'), phone: g('phone'), email: g('email'), birthday: g('birthday'), note: g('note') }); persist('customers', c);
+  Object.assign(c, { name: g('name'), phone: g('phone'), email: g('email'), birthday: g('birthday'), note: g('note'), type: g('type') === 'reseller' ? 'reseller' : 'retail' }); persist('customers', c);
   if (cuRet === 'pick') { custId = c.id; closeModal(); updateCart(); toast(`Customer: ${c.name}`); } else { closeModal(); render(); custSheet(c.id); }
 }
 function adjSheet(id) {
@@ -890,8 +892,8 @@ function updateCp() {
   $('#cpList').innerHTML = list.map(c => custRowHtml(c, 'cpSelect')).join('') || `<div class="empty" style="padding:18px">${db.customers.length ? 'No match' : 'No customers yet'}</div>`;
 }
 function customersCsv() {
-  const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`, rows = [['No', 'Name', 'Phone', 'Email', 'Birthday', 'Points', 'Visits', 'Total spent', 'Last visit', 'Member since', 'Note']];
-  db.customers.forEach(c => rows.push([c.no, c.name, c.phone, c.email, c.birthday, c.points, c.visits || 0, c.spent || 0, c.lastVisit ? new Date(c.lastVisit).toISOString() : '', new Date(c.created).toISOString(), c.note]));
+  const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`, rows = [['No', 'Name', 'Type', 'Phone', 'Email', 'Birthday', 'Points', 'Visits', 'Total spent', 'Last visit', 'Member since', 'Note']];
+  db.customers.forEach(c => rows.push([c.no, c.name, c.type === 'reseller' ? 'Reseller' : 'Retail', c.phone, c.email, c.birthday, c.points, c.visits || 0, c.spent || 0, c.lastVisit ? new Date(c.lastVisit).toISOString() : '', new Date(c.created).toISOString(), c.note]));
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['﻿' + rows.map(r => r.map(q).join(',')).join('\n')], { type: 'text/csv' }));
   a.download = `epos-customers-${new Date().toISOString().slice(0, 10)}.csv`; a.click(); logEv('export', 'Exported customer list CSV');
 }
@@ -974,12 +976,12 @@ function updateStock() {
   const list = db.products.filter(p => (!k || [p.name, p.sku, p.cat].some(x => (x || '').toLowerCase().includes(k))) && (stockF === 'all' || (p.stock !== null && (stockF === 'out' ? p.stock <= 0 : p.stock <= p.low))));
   $('#stockList').innerHTML = list.map(p => `<div class="row"><button class="rowb" data-act="edit" data-id="${p.id}"><span class="pi" style="background:${hue(p.cat || p.name)}">${picHtml(p)}</span>
       <span class="m"><b>${esc(p.name)}</b><small>${esc([p.sku, p.cat].filter(Boolean).join(' · ')) || '—'}</small></span></button>
-      <span class="pr">${money(p.price)}${stockBadge(p) || '<small style="font-weight:400;color:var(--l2)">not tracked</small>'}</span>
+      <span class="pr">${money(p.price)}${p.priceR > 0 ? `<small style="font-weight:400;color:var(--l2)">R: ${money(p.priceR)}</small>` : ''}${stockBadge(p) || '<small style="font-weight:400;color:var(--l2)">not tracked</small>'}</span>
       ${p.stock !== null ? `<div class="step"><button data-act="sadj" data-id="${p.id}" data-d="-1">−</button><button data-act="sadj" data-id="${p.id}" data-d="1">+</button></div>` : ''}</div>`).join('')
     || '<div class="empty">No items</div>';
 }
 function productForm(p) {
-  const n = !p; p = p || { name: '', sku: '', cat: '', price: '', cost: '', stock: 0, low: 5, icon: '' };
+  const n = !p; p = p || { name: '', sku: '', cat: '', price: '', cost: '', priceR: '', stock: 0, low: 5, icon: '' };
   const R = (l, h) => `<label class="frow"><span>${l}</span>${h}</label>`, inp = (id, v, ex = '') => `<input id="${id}" value="${esc(v)}" ${ex}>`;
   imgDraft = p.img || null;
   modal(`<h2>${n ? 'New item' : 'Edit item'}</h2>
@@ -988,7 +990,8 @@ function productForm(p) {
     <div class="group">${R('Name', inp('fName', p.name, 'autocomplete="off"'))}${R('Icon (emoji)', inp('fIcon', p.icon || '', 'maxlength="4" placeholder="optional"'))}
     ${R('Category', inp('fCat', p.cat, 'list="cats" autocomplete="off"') + `<datalist id="cats">${[...new Set(db.products.map(x => x.cat).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist>`)}
     ${R('SKU / barcode', inp('fSku', p.sku, 'autocomplete="off"') + `<button class="x2" style="color:var(--tint)" data-act="scanSku" aria-label="Scan">${ICON.scan}</button>`)}</div>
-    <div class="group">${R('Price', inp('fPrice', p.price, 'type="number" inputmode="decimal" step="any"'))}${R('Cost', inp('fCost', p.cost, 'type="number" inputmode="decimal" step="any" placeholder="optional"'))}</div>
+    <div class="group">${R('Price', inp('fPrice', p.price, 'type="number" inputmode="decimal" step="any"'))}${R('Cost', inp('fCost', p.cost, 'type="number" inputmode="decimal" step="any" placeholder="optional"'))}
+    ${R('Reseller price', inp('fPriceR', p.priceR || '', 'type="number" inputmode="decimal" step="any" placeholder="same as price"'))}</div>
     <div class="group">${R('Stock', inp('fStock', p.stock === null ? '' : p.stock, 'type="number" inputmode="numeric" placeholder="not tracked"'))}${R('Low-stock alert at', inp('fLow', p.low, 'type="number" inputmode="numeric"'))}</div>
     <button class="btn pri big" data-act="saveProd" data-id="${n ? '' : p.id}">Save</button>
     ${n ? '' : `<button class="btn dng" data-act="delProd" data-id="${p.id}">Delete item</button>`}<button class="btn" data-act="close">Cancel</button>`);
@@ -997,8 +1000,9 @@ function saveProd(id) {
   const g = i => $('#' + i).value.trim();
   if (!g('fName')) return toast('Name is required', true);
   if (g('fPrice') === '' || +g('fPrice') < 0) return toast('Enter a valid price', true);
+  if (g('fPriceR') !== '' && +g('fPriceR') < 0) return toast('Enter a valid reseller price', true);
   const sku = g('fSku'); if (sku && db.products.some(x => x.sku === sku && x.id !== id)) return toast('SKU already used by another item', true);
-  const d = { name: g('fName'), icon: g('fIcon'), img: imgDraft, sku, cat: g('fCat'), price: +g('fPrice'), cost: +g('fCost') || 0, stock: g('fStock') === '' ? null : Math.max(0, parseInt(g('fStock'))), low: parseInt(g('fLow')) || 0 };
+  const d = { name: g('fName'), icon: g('fIcon'), img: imgDraft, sku, cat: g('fCat'), price: +g('fPrice'), cost: +g('fCost') || 0, priceR: +g('fPriceR') || 0, stock: g('fStock') === '' ? null : Math.max(0, parseInt(g('fStock'))), low: parseInt(g('fLow')) || 0 };
   let p;
   if (id) { p = prod(id); if (p.price !== d.price) logEv('price', `${p.name}: price ${money(p.price)} → ${money(d.price)}`); if (p.stock !== d.stock) logEv('stock', `${p.name}: stock ${p.stock ?? '–'} → ${d.stock ?? '–'}`); const ns = d.stock; delete d.stock; Object.assign(p, d); if (ns === null) p.stock = null; else { if (p.stock === null) p.stock = db.moves.filter(m => m.pid === p.id).reduce((a, m) => a + m.d, 0); setStock(p, ns); } }
   else { const ns = d.stock; d.stock = ns === null ? null : 0; p = { id: uid(), ...d }; db.products.push(p); if (ns) setStock(p, ns); logEv('item', `Added item ${p.name}`); }
@@ -1571,8 +1575,8 @@ const A = {
   custAdjOk: d => { const c = cust(d.id), n = parseInt($('#adjN').value); if (!n) return toast('Enter the number of points', true); c.points = Math.max(0, c.points + n); (c.adj = c.adj || []).unshift({ ts: Date.now(), by: me.name, delta: n, reason: $('#adjR').value.trim() }); persist('customers', c); logEv('points', `${c.name}: ${n > 0 ? '+' : ''}${n} points${$('#adjR').value.trim() ? ' (' + $('#adjR').value.trim() + ')' : ''}`); custSheet(d.id); },
   custDel: d => { const c = cust(d.id); if (!confirm(`Delete ${c.name}? Their past sales stay in the history.`)) return; db.customers = db.customers.filter(x => x.id !== d.id); IDB.del('customers', d.id); if (custId === d.id) custId = null; logEv('customer', `Deleted customer ${c.name}`); closeModal(); render(); },
   custSelect: d => { custId = d.id; closeModal(); view = 'sell'; render(); toast(`Customer: ${cust(d.id).name}`); },
-  custPick: () => custPicker(), custClear: () => { custId = null; closeModal(); updateCart(); },
-  cpSelect: d => { custId = d.id; closeModal(); updateCart(); toast(`Customer: ${cust(d.id).name}`); }, cpNew: () => customerForm(null, 'pick'),
+  custPick: () => custPicker(), custClear: () => { custId = null; closeModal(); updateGrid(); updateCart(); },
+  cpSelect: d => { custId = d.id; closeModal(); updateGrid(); updateCart(); toast(`Customer: ${cust(d.id).name}`); }, cpNew: () => customerForm(null, 'pick'),
   custCsv: () => askSecret('Export customers', 'CSV files are not encrypted. Enter your password to continue.', customersCsv),
   ckPtsMax: () => { ck.pts = maxPts(); const i = $('#ckPts'); if (i) i.value = ck.pts; ckUpdate(); },
   poCancel: () => { if (!confirm('Cancel this order?')) return; POD.status = 'cancelled'; const k = db.pos.findIndex(x => x.id === POD.id); db.pos[k] = POD; persist('pos', POD); logEv('po', `Cancelled ${POD.no}`); closeModal(); render(); },
