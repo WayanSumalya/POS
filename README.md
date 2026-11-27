@@ -23,7 +23,7 @@ First launch → create the admin account. Settings → Team → Add user.
 ## Customers & loyalty
 Customers tab (cashiers can add/look up; only admins edit, adjust points, delete, export). Attach a customer to an order, earn points on the amount paid, redeem points as a discount at checkout. Rates are in Settings → Loyalty program. Voiding a sale reverses points. Receipts show points earned and balance.
 
-**Reseller pricing:** mark a customer as "Reseller" in their profile. Items with a Reseller price set (Inventory → edit item) use that price automatically whenever that customer is attached to the order; items without one keep charging the regular retail price. No customer attached, or customer marked "Retail" → retail price always.
+**Reseller pricing:** items can have a Reseller price set (Inventory → edit item) alongside the regular retail price. Two ways to switch an order to reseller pricing: tap the "Reseller pricing" chip above the item grid in Sell (quick, no customer needed — resets after each sale), or attach a customer marked "Reseller" in their profile (persists their pricing automatically whenever that customer is picked). Either way, items without a reseller price keep charging retail.
 
 ## Receiving
 Inventory → Receiving: record deliveries as goods-received notes (GRN-0001…) against a purchase order (partial deliveries supported) or without a PO. Supplier invoice number, cost updates, printable.

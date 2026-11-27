@@ -31,7 +31,7 @@ const brandMark = (cls = '') => `<span class="logo ${cls}">${meta && safeImg(met
 let db = null;          // decrypted working data (only while unlocked)
 let meta = null;        // plaintext: user list (wrapped keys), prefs
 let me = null, dek = null, dekRaw = null;
-let view = 'sell', cart = [], q = '', cat = 'All', discount = 0, stockQ = '', stockF = 'all', salesF = 'today', ck = null, lastUser = null;
+let view = 'sell', cart = [], q = '', cat = 'All', discount = 0, resellerMode = false, stockQ = '', stockF = 'all', salesF = 'today', ck = null, lastUser = null;
 let L = { sel: null, pin: '', busy: false, err: '' };
 const isAdmin = () => !!me && me.role === 'admin';
 const prod = id => db.products.find(p => p.id === id);
@@ -269,7 +269,7 @@ async function tryLogin(u, secret) {
     u.fails = 0; u.until = 0; await saveMeta(true);
     me = { id: u.id, name: u.name, role: u.role };
     await loadDb();
-    if (lastUser !== me.id) { cart = []; custId = null; }
+    if (lastUser !== me.id) { cart = []; custId = null; resellerMode = false; }
     lastUser = me.id; logEv('login', 'Signed in'); enterApp();
   } catch (e) { console.error('open data failed', e); dek = null; me = null; L.busy = false; L.err = 'Could not open data (' + ((e && (e.message || e.name)) || 'unknown') + ')'; renderLogin(); }
 }
@@ -439,7 +439,7 @@ let imgDraft = null, avTarget = null, modalUser = null;
 function updateGrid() {
   const cats = ['All', ...new Set(db.products.map(p => p.cat).filter(Boolean))];
   if (!cats.includes(cat)) cat = 'All';
-  $('#chips').innerHTML = cats.map(c => `<button class="chip ${c === cat ? 'on' : ''}" data-act="cat" data-c="${esc(c)}">${esc(c)}</button>`).join('');
+  $('#chips').innerHTML = `<button class="chip ${resellerMode ? 'on' : ''}" data-act="toggleRes">Reseller pricing</button>` + cats.map(c => `<button class="chip ${c === cat ? 'on' : ''}" data-act="cat" data-c="${esc(c)}">${esc(c)}</button>`).join('');
   const k = q.trim().toLowerCase();
   const list = db.products.filter(p => (cat === 'All' || p.cat === cat) && (!k || p.name.toLowerCase().includes(k) || (p.sku || '').toLowerCase().includes(k)));
   $('#grid').innerHTML = list.map(p => {
@@ -453,7 +453,7 @@ function updateGrid() {
 /* ---------- loyalty ---------- */
 const lyOn = () => S().loyaltyOn !== false;
 const cust = id => db.customers.find(c => c.id === id) || null;
-const priceFor = p => { const c = cust(custId); return c && c.type === 'reseller' && p.priceR > 0 ? p.priceR : p.price; };
+const priceFor = p => { const c = cust(custId); return (resellerMode || (c && c.type === 'reseller')) && p.priceR > 0 ? p.priceR : p.price; };
 const earnPts = base => lyOn() && +S().earnPer > 0 ? Math.floor(Math.max(base, 0) / +S().earnPer) : 0;
 const ptsValue = n => r2(n * (+S().ptValue || 0));
 function totals(disc, rv = 0) { // rv = value of redeemed loyalty points
@@ -545,7 +545,7 @@ function finishSale(print) {
     sale.customerId = c.id; sale.customerName = c.name; sale.pts = { earned, used, balance: c.points };
   }
   sale.items.forEach(i => { const p = prod(i.id); if (p && p.stock !== null) setStock(p, Math.max(0, p.stock - i.qty)); });
-  db.sales.unshift(sale); cart = []; discount = 0; custId = null; saveSale(sale); saveVault();
+  db.sales.unshift(sale); cart = []; discount = 0; custId = null; resellerMode = false; saveSale(sale); saveVault();
   if (t.disc) logEv('discount', `${sale.no}: discount ${money(t.disc)}`);
   closeModal(); render(); showReceipt(sale); if (print) doPrint(sale);
 }
@@ -1256,7 +1256,7 @@ async function importBackup(file) {
       t.objectStore('kv').put(d.meta, 'users'); t.objectStore('vault').put(d.vault, 'main');
       DOCS.forEach(n => { const o = t.objectStore(n); o.clear(); (d[n] || []).forEach(x => o.put(x)); });
     });
-    meta = d.meta; meta.upd = Date.now(); meta.users.forEach(u => { u.credUpd = Date.now(); }); await IDB.put('kv', meta, 'users'); cart = []; lastUser = null; markAllDirty(); toast('Backup restored — please sign in'); showLogin();
+    meta = d.meta; meta.upd = Date.now(); meta.users.forEach(u => { u.credUpd = Date.now(); }); await IDB.put('kv', meta, 'users'); cart = []; resellerMode = false; lastUser = null; markAllDirty(); toast('Backup restored — please sign in'); showLogin();
   } catch (e) { toast('Not a valid EPOS backup file', true); }
 }
 
@@ -1504,10 +1504,11 @@ const ADMIN_RE = /^(scan(Sku|Inv|Count|Po|Rcv)|po[A-Z]|sup|cnt|rc|grn|newPo|newC
 const A = {
   nav: d => { view = d.v; render(); },
   cat: d => { cat = d.c; updateGrid(); },
+  toggleRes: () => { resellerMode = !resellerMode; updateGrid(); updateCart(); },
   add: d => addToCart(d.id), inc: d => addToCart(d.id),
   dec: d => { const c = cart.find(x => x.id === d.id); if (c && --c.qty <= 0) cart = cart.filter(x => x !== c); updateGrid(); updateCart(); },
   rm: d => { cart = cart.filter(x => x.id !== d.id); updateGrid(); updateCart(); },
-  clear: () => { if (confirm('Clear the current order?')) { cart = []; discount = 0; custId = null; updateGrid(); updateCart(); } },
+  clear: () => { if (confirm('Clear the current order?')) { cart = []; discount = 0; custId = null; resellerMode = false; updateGrid(); updateCart(); } },
   cartOpen: () => $('#cart').classList.add('open'), cartClose: () => $('#cart').classList.remove('open'),
   checkout: () => { $('#cart').classList.remove('open'); openCheckout(); },
   ckm: d => { ck.method = d.m; renderCheckout(); },
